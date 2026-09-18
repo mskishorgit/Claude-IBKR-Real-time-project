@@ -2,13 +2,13 @@
 
 A full-stack project for building a live scalping dashboard on top of Interactive
 Brokers TWS/Gateway: IBKR → FastAPI backend → WebSocket → React frontend, with a
-live-updating candlestick chart. There is no strategy/signal logic or order
-placement yet — this is the live market-data pipeline and charting layer it will
-sit on top of.
+live-updating candlestick chart and a rule-based signal engine that flags
+potential entries. There is no order placement yet — this is detection and
+alerting on top of the live market-data pipeline.
 
 ```
 scalp-dashboard/
-├── backend/    FastAPI + ib_async, connects to TWS/IB Gateway and streams bars
+├── backend/    FastAPI + ib_async + a rule-based signal engine
 └── frontend/   React + TypeScript + Vite + Tailwind + lightweight-charts
 ```
 
@@ -79,6 +79,9 @@ silent failure.
 | `DEFAULT_TICKERS` | `AAPL,MSFT,SPY` | Tickers subscribed on startup |
 | `CORS_ORIGINS` | `http://localhost:5173` | Allowed frontend origin(s) |
 
+See `.env.example` for the signal engine's `SIGNALS_*` variables (one enabled
+flag and its key thresholds per rule) — covered in detail below.
+
 ### Backend API
 
 - `GET /api/status` — connection state (`connected` / `connecting` /
@@ -91,8 +94,100 @@ silent failure.
 - `WS /ws/bars` — streams JSON messages:
   - `{"type": "status", "state": ..., "error": ...}` on connection state changes
   - `{"type": "tickers", "tickers": [...]}` when the tracked list changes
-  - `{"type": "bar", "symbol": ..., "timestamp": ..., "open": ..., "high": ..., "low": ..., "close": ..., "volume": ...}` for each new/updated 1-minute bar
+  - `{"type": "bar", "symbol": ..., "timestamp": ..., "open": ..., "high": ..., "low": ..., "close": ..., "volume": ...}` for each bar update, including intra-bar ticks as the current bar forms
   - `{"type": "ticker_error", "symbol": ..., "code": ..., "message": ...}` for per-symbol issues (e.g. missing market data subscription)
+- `WS /ws/signals` — a **separate** channel (so a client can subscribe to
+  just this) streaming `{"type": "signal", "ticker": ..., "rule": ...,
+  "direction": "long"|"short", "price": ..., "volume": ..., "timestamp": ...,
+  "details": {...}}` whenever the signal engine flags a potential entry.
+  Nothing else is sent on this channel.
+
+### The signal engine
+
+`backend/app/signals/` is a standalone, dependency-free package (no
+FastAPI/ib_async imports) that flags potential scalping entries from
+finalized 1-minute bars. It's wired into the live server via
+`MarketDataManager.add_bar_closed_listener` (see below), and driven
+identically by the CSV backtest CLI — same rules, same code path, whether
+the bars come from IBKR live or a CSV.
+
+**This step is detection and alerting only — it never places an order.**
+
+Four named, independently configurable rules (`backend/app/signals/rules.py`,
+enabled/tuned via the `SIGNALS_*` env vars or by constructing rule objects
+directly in code/tests):
+
+1. **`vwap_reclaim`** — price was extended away from VWAP for several
+   consecutive bars, then this bar closes back on the other side of VWAP on
+   above-average volume. Extended below → reclaim (long). Extended above →
+   rejection (short).
+2. **`ema_cross`** — the fast EMA (default period 9) crosses the slow EMA
+   (default period 20) on rising volume (this bar's volume exceeds the
+   previous bar's by a configurable multiplier).
+3. **`volume_spike_breakout`** — this bar's volume is `N` standard
+   deviations above its rolling average, *and* this bar breaks the prior
+   `M`-bar high or low. (The spec names both thresholds "N" in prose; they're
+   independent knobs here — `volume_spike_std_dev_threshold` and
+   `volume_spike_breakout_lookback_bars` — since a volatility multiplier and
+   a bar-count window aren't interchangeable.)
+4. **`relative_volume_filter`** — not an independent trigger, but a gate
+   applied to the three rules above: suppresses a candidate signal unless
+   today's cumulative volume pace (at the bar's time of day) is at least
+   `min_ratio` times the average pace seen at that same time of day across
+   prior sessions. The baseline has no persistence across restarts and no
+   external multi-day warm-up by default — it's only as good as what the
+   process has observed since it started (or was fed via backtest).
+
+Every emitted signal includes `ticker`, `rule`, `direction`, `price`,
+`volume`, `timestamp`, and a `details` dict with rule-specific context (VWAP
+value, EMA values, volume z-score, the relative-volume reading, etc.) so you
+can judge signal quality, not just trust it blindly.
+
+#### Backtesting against a CSV or IBKR historical export
+
+```bash
+cd backend
+source .venv/bin/activate
+python -m app.signals.backtest --csv path/to/bars.csv --out fired_signals.csv
+```
+
+- Accepts a CSV with `symbol`/`ticker`, `timestamp`/`date`, `open`, `high`,
+  `low`, `close`, `volume` columns (case-insensitive, several common aliases
+  recognized) — including IBKR's own historical-data export format. If the
+  CSV has no symbol column (a single-symbol export), pass `--symbol AAPL`.
+- Runs the exact same `SignalEngine` used live, in order, over the whole
+  file, and prints every bar that would have fired a signal (rule, direction,
+  price/volume, timestamp). `--out` additionally writes them to a CSV.
+- This is the tool for sanity-checking rule quality and tuning thresholds
+  before trusting the live `/ws/signals` feed.
+
+#### Why bar-closed vs. raw bar streaming are different paths
+
+`MarketDataManager` distinguishes two things from the same underlying
+ib_async `updateEvent`: intra-bar ticks (the current bar updating in place,
+`hasNewBar=False`) which stream to `/ws/bars` for the live chart, and a bar
+*finalizing* (`hasNewBar=True`, meaning the bar before the newly-appended one
+just closed) which is what's handed to `add_bar_closed_listener` — and
+therefore to the signal engine. The engine never evaluates a partial,
+still-forming bar; the chart never waits for a bar to close to show it
+forming. This also warms up indicator state (EMA/VWAP/rolling volume) from
+the already-completed history fetched at subscribe time, rather than the
+engine starting from nothing on the first live bar.
+
+#### Backend tests
+
+```bash
+cd backend
+source .venv/bin/activate
+pip install -r requirements-dev.txt
+python -m pytest tests/ -v
+```
+
+Covers each rule firing and *not* firing under a hand-built deterministic
+bar sequence, the relative-volume filter suppressing a signal (with an
+identical unfiltered run proving the filter — not something else — was
+responsible), the CSV loader, and the bar-closed vs. raw-bar dispatch logic
+in `MarketDataManager`.
 
 ### Common error states
 
@@ -170,10 +265,13 @@ same API, so `from ib_async import IB, Stock` is a drop-in replacement for
 
 - No watchlist grid of multiple charts at once (the chart component is built
   to support this next, but the UI only shows one at a time so far).
-- No strategy/signal logic.
-- No order placement.
-- No persistence of bar history (only what's held in memory per browser tab
-  and per backend process since they started, plus whatever IBKR returns for
-  the initial lookback window).
+- No frontend UI for the signal feed yet (`/ws/signals` exists and can be
+  subscribed to directly; there's no panel/toast rendering it in the React
+  app so far).
+- No order placement — the signal engine only detects and alerts.
+- No persistence of bar or signal history (only what's held in memory per
+  browser tab and per backend process since they started, plus whatever
+  IBKR returns for the initial lookback window). The relative-volume
+  baseline resets on backend restart for the same reason.
 
 These come in later steps, on top of this working data pipeline.

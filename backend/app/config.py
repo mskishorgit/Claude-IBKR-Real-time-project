@@ -17,6 +17,28 @@ class Settings(BaseSettings):
     default_tickers: str = "AAPL,MSFT,SPY"
     cors_origins: str = "http://localhost:5173"
 
+    # Signal engine: named, independently tunable rules. See
+    # app/signals/rules.py for what each threshold means.
+    signals_vwap_reclaim_enabled: bool = True
+    signals_vwap_extension_pct: float = 0.15
+    signals_vwap_lookback_bars: int = 5
+    signals_vwap_volume_window: int = 20
+    signals_vwap_volume_multiplier: float = 1.2
+
+    signals_ema_cross_enabled: bool = True
+    signals_ema_fast_period: int = 9
+    signals_ema_slow_period: int = 20
+    signals_ema_volume_multiplier: float = 1.1
+
+    signals_volume_spike_enabled: bool = True
+    signals_volume_spike_window: int = 20
+    signals_volume_spike_std_dev_threshold: float = 2.0
+    signals_volume_spike_breakout_lookback_bars: int = 20
+
+    signals_relative_volume_filter_enabled: bool = True
+    signals_relative_volume_min_ratio: float = 1.0
+    signals_relative_volume_min_sessions: int = 1
+
     @property
     def ibkr_port(self) -> int:
         return self.ibkr_paper_port if self.ibkr_trading_mode.lower() == "paper" else self.ibkr_live_port

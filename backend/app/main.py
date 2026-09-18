@@ -11,6 +11,8 @@ from pydantic import BaseModel, field_validator
 from .config import get_settings
 from .ibkr.connection import ConnectionState, IBKRConnectionManager
 from .ibkr.market_data import MarketDataManager, TickerAlreadyTracked
+from .signals.factory import build_default_engine
+from .signals.models import Bar, Signal
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -26,7 +28,51 @@ connection_manager = IBKRConnectionManager(
 )
 market_data_manager = MarketDataManager(connection_manager.ib)
 
+signal_engine = build_default_engine(
+    vwap_reclaim_enabled=settings.signals_vwap_reclaim_enabled,
+    vwap_extension_pct=settings.signals_vwap_extension_pct,
+    vwap_lookback_bars=settings.signals_vwap_lookback_bars,
+    vwap_volume_window=settings.signals_vwap_volume_window,
+    vwap_volume_multiplier=settings.signals_vwap_volume_multiplier,
+    ema_cross_enabled=settings.signals_ema_cross_enabled,
+    ema_fast_period=settings.signals_ema_fast_period,
+    ema_slow_period=settings.signals_ema_slow_period,
+    ema_volume_multiplier=settings.signals_ema_volume_multiplier,
+    volume_spike_enabled=settings.signals_volume_spike_enabled,
+    volume_spike_window=settings.signals_volume_spike_window,
+    volume_spike_std_dev_threshold=settings.signals_volume_spike_std_dev_threshold,
+    volume_spike_breakout_lookback_bars=settings.signals_volume_spike_breakout_lookback_bars,
+    relative_volume_filter_enabled=settings.signals_relative_volume_filter_enabled,
+    relative_volume_min_ratio=settings.signals_relative_volume_min_ratio,
+    relative_volume_min_sessions=settings.signals_relative_volume_min_sessions,
+)
+
 _status_subscribers: list[asyncio.Queue] = []
+_signal_subscribers: list[asyncio.Queue] = []
+
+
+def _on_bar_closed(bar: Bar) -> None:
+    try:
+        signals = signal_engine.process_bar(bar)
+    except Exception:
+        logger.exception("Signal engine raised while processing a bar for %s", bar.symbol)
+        return
+    for signal in signals:
+        logger.info("Signal fired: %s %s %s @ %s", signal.ticker, signal.rule, signal.direction, signal.price)
+        _broadcast_signal(signal)
+
+
+def _broadcast_signal(signal: Signal) -> None:
+    payload = {"type": "signal", **signal.to_dict()}
+    for queue in list(_signal_subscribers):
+        try:
+            queue.put_nowait(payload)
+        except asyncio.QueueFull:
+            logger.warning("Dropping signal for slow WebSocket subscriber")
+
+
+market_data_manager.add_bar_closed_listener(_on_bar_closed)
+market_data_manager.add_ticker_removed_listener(signal_engine.reset_symbol)
 
 
 def _broadcast_status(state: ConnectionState, error: str | None) -> None:
@@ -153,3 +199,31 @@ async def stream_bars(websocket: WebSocket):
         if status_queue in _status_subscribers:
             _status_subscribers.remove(status_queue)
         market_data_manager.unsubscribe(bar_queue)
+
+
+@app.websocket("/ws/signals")
+async def stream_signals(websocket: WebSocket):
+    """Dedicated channel for flagged entries from the signal engine — kept
+    separate from /ws/bars so a client can subscribe to just one."""
+    await websocket.accept()
+
+    signal_queue: asyncio.Queue = asyncio.Queue(maxsize=200)
+    _signal_subscribers.append(signal_queue)
+
+    async def pump() -> None:
+        while True:
+            message = await signal_queue.get()
+            await websocket.send_json(message)
+
+    pump_task = asyncio.create_task(pump())
+    try:
+        while True:
+            # No client messages expected; reading keeps the receive buffer
+            # drained and lets us detect a disconnect promptly.
+            await websocket.receive_text()
+    except WebSocketDisconnect:
+        pass
+    finally:
+        pump_task.cancel()
+        if signal_queue in _signal_subscribers:
+            _signal_subscribers.remove(signal_queue)
