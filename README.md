@@ -4,10 +4,11 @@ A full-stack project for building a live scalping dashboard on top of Interactiv
 Brokers TWS/Gateway: IBKR → FastAPI backend → WebSocket → React frontend, with a
 live-updating candlestick chart, a rule-based signal engine that flags
 potential entries, a notification layer (browser push, in-app alerts, sound,
-optional Telegram), and an options trading panel that can place real 0DTE/weekly
+optional Telegram), an options trading panel that can place real 0DTE/weekly
 option orders through IBKR — paper by default, live gated behind an explicit,
-visible arm switch. **Read the "Options trading panel" section before touching
-that part of the UI against a live account.**
+visible arm switch — and a live watchlist/portfolio view pulling the account's
+actual positions and P/L straight from IBKR. **Read the "Options trading panel"
+section before touching that part of the UI against a live account.**
 
 ```
 scalp-dashboard/
@@ -123,6 +124,16 @@ flag and its key thresholds per rule) — covered in detail below.
 - `WS /ws/positions` — live P/L (`position_update`) and stop/target alerts
   (`stop_target_alert`) for open positions; sends a `positions_snapshot` on
   connect.
+- `GET /api/portfolio/positions` — live IBKR account positions (via
+  `reqAccountUpdates`), split into `positions` (equities/ETFs/anything that
+  isn't an option) and `option_positions` (with strike/expiry/greeks). This
+  is the account's actual holdings — not just positions opened through this
+  app's own options order flow (that's `/api/options/positions` above).
+- `GET /api/portfolio/summary` — net liquidation, buying power, and day
+  realized/unrealized P/L for the account.
+- `WS /ws/portfolio` — sends a `portfolio_snapshot` (both position lists +
+  the summary) on connect, then `position_update` / `option_position_update`
+  / `account_summary` messages as IBKR reports changes.
 
 ### The signal engine
 
@@ -340,6 +351,72 @@ behave exactly like production) — including that a preview is rejected the
 second time it's used, and that both `create_preview` and `close_position`
 are blocked when live trading isn't armed.
 
+### Watchlist & portfolio
+
+`backend/app/account/portfolio.py` wraps `ib.reqAccountUpdates(account)` —
+one always-on subscription that gives both live positions
+(`updatePortfolioEvent`, with IBKR's own live market price and
+unrealized/realized P/L already computed) and the account summary
+(`accountValueEvent`: net liquidation, buying power, day P/L) for the
+session's managed account. It restarts automatically on every reconnect
+(hooked into the same connection-state listener the rest of the app uses),
+since a fresh `ib_async` session has no memory of the previous subscription.
+
+- **Equity vs. option positions are genuinely separate types**
+  (`AccountPosition` / `AccountOptionPosition`), not one shape with optional
+  fields bolted on — options additionally get their own `reqMktData`
+  subscription (reusing `options/quotes.py`, so IBKR's "no data" sentinels
+  are interpreted identically everywhere in this project) for delta/IV,
+  which equities don't have.
+- **Account summary currency handling**: IBKR reports each tag once per
+  currency. The summary picks one currency per field and sticks to it — a
+  `"BASE"` value always takes over (so a multi-currency account doesn't
+  flap between currencies), and once a field has picked a currency,
+  further updates keep flowing from that same currency, which is what
+  makes the summary strip "refreshing live" rather than frozen after the
+  first tick. (An earlier version of this filter naively preferred `"BASE"`
+  and silently stopped updating altogether for accounts that never report
+  one — a caught-and-fixed bug, and a regression test for it lives in
+  `tests/test_portfolio_service.py`.)
+- **The watchlist grid, sparklines, and "% change today" are frontend-only
+  compositions of data this app already streams** — no new backend surface
+  for those. Last price and the sparkline come from `barsBySymbol` (already
+  in memory from `/ws/bars`); "% change today" is approximated as the move
+  since the first bar this process has seen for that symbol (not a true
+  previous-close baseline — see the caveat below), same style of
+  approximation as the chart's VWAP session reset.
+- **The signal-active highlight** (`frontend/src/signalActivity.ts`) treats
+  a fired signal as "active" for a fixed window (5 minutes) after it fires,
+  since a signal is a point-in-time event, not a persisting state IBKR or
+  the signal engine tracks — reuses the same `/ws/signals` stream the
+  notification layer already subscribes to.
+
+#### Portfolio tests
+
+```bash
+cd backend
+source .venv/bin/activate
+python -m pytest tests/test_portfolio_service.py -v
+```
+
+Covers the account-value currency-picking logic described above (including
+the regression test for the frozen-summary bug), splitting equity vs.
+option positions, subscribing to greeks exactly once per option contract
+(not once per portfolio update), and enriching a position with delta/IV
+once a matching ticker update arrives — all against a fake IBKR client
+using real `eventkit.Event` objects, so `+=`/`.emit()` behave exactly like
+the real `ib_async` events this service listens to.
+
+#### Caveat: "% change today" isn't a true previous-close baseline
+
+Getting a real previous-session close would mean a separate historical-data
+snapshot per symbol; this step instead uses the earliest bar already held
+in memory for that symbol as the reference point, which is only exactly
+right if the ticker was added to the watchlist before that session's first
+print. Documented here rather than silently assumed — see the chart's VWAP
+session-reset caveat for the same kind of tradeoff made elsewhere in this
+project.
+
 ### Common error states
 
 The backend is built to surface these clearly instead of failing silently:
@@ -375,14 +452,21 @@ Open the printed local URL (default `http://localhost:5173`). You should see:
 - A connection status pill (connected / connecting / reconnecting /
   disconnected) reflecting the backend's live IBKR connection state, with the
   underlying error message shown underneath when disconnected.
+- An **account summary strip**: net liquidation, buying power, and day
+  realized/unrealized P/L, refreshing live.
+- A **watchlist grid**: compact tiles per tracked ticker with last price,
+  % change today, a mini sparkline, and a colored border (green/red) when a
+  scalping signal is currently active on that ticker. Add/remove tickers
+  directly from this view; click a tile to make it the selected ticker
+  everywhere else on the page (chart, options panel).
 - A live candlestick chart (with a volume pane below it) for the selected
   ticker, updating in real time as new bars stream in over the same
   WebSocket. Tabs above the chart switch symbols without reconnecting.
 - VWAP, EMA(9), and EMA(20) overlays, each independently toggleable.
 - A dashed live price line on the chart tracking the latest close.
-- A ticker control box to add/remove symbols at runtime.
 - A **signal alerts tray** (top-right) showing recent fired signals as
-  dismissible cards — click one to jump the chart to that ticker.
+  dismissible cards — click one to jump the chart (and watchlist selection)
+  to that ticker.
 - A **Signal alerts** settings section: enable browser push notifications,
   mute/test the audible alert, set the per-ticker/rule cooldown (default 2
   minutes), and pick which rules generate alerts at all.
@@ -395,6 +479,11 @@ Open the printed local URL (default `http://localhost:5173`). You should see:
   persistent banner appears whenever connected to a live account, escalating
   once you arm it. **Read the backend's "Options trading panel" section
   above before using this against a live account.**
+- A **portfolio table**: the account's actual IBKR positions (not just ones
+  opened through this app), in separate equities/ETFs and options sections
+  — the options section additionally shows strike/expiry/delta/IV, and both
+  show % of account (computed client-side from market value ÷ net
+  liquidation, so it always uses whatever summary figure is freshest).
 
 ### The chart component
 
@@ -402,8 +491,10 @@ Open the printed local URL (default `http://localhost:5173`). You should see:
 component — it only needs `symbol` and an ascending, per-symbol `bars` array;
 it doesn't know about the WebSocket or REST layer. It accepts `height`,
 `showVolume`, `overlays` (`{ vwap, ema9, ema20 }`), and a `compact` flag that
-trims axes/labels for small tiles. This is meant to be dropped into a future
-watchlist grid of several small charts without changes.
+trims axes/labels for small tiles, for exactly this kind of small-tile reuse
+(the watchlist grid above uses a lightweight inline-SVG `Sparkline` instead
+of a full chart instance per tile — one `lightweight-charts` instance per
+watchlist tile would be excessive for a grid of many).
 
 Indicators (`frontend/src/indicators.ts`) are computed client-side from the
 bars already held in the browser (`useBackendSocket`'s `barsBySymbol`), not
@@ -449,6 +540,7 @@ toast's ticker calls the same `onSelectSymbol` the chart's ticker tabs use.
 | `VITE_BACKEND_SIGNALS_WS_URL` | `ws://localhost:8000/ws/signals` | Signal alert WebSocket URL |
 | `VITE_BACKEND_OPTIONS_WS_URL` | `ws://localhost:8000/ws/options` | Options chain quote WebSocket URL |
 | `VITE_BACKEND_POSITIONS_WS_URL` | `ws://localhost:8000/ws/positions` | Option positions WebSocket URL |
+| `VITE_BACKEND_PORTFOLIO_WS_URL` | `ws://localhost:8000/ws/portfolio` | Account positions/summary WebSocket URL |
 
 ## Notes on the IBKR library choice
 
@@ -459,18 +551,18 @@ same API, so `from ib_async import IB, Stock` is a drop-in replacement for
 
 ## What's not in this step
 
-- No watchlist grid of multiple charts at once (the chart component is built
-  to support this next, but the UI only shows one at a time so far).
 - No auto-submitted bracket order for stop-loss/profit-target — crossing a
   level only flags/alerts (see "Options trading panel" above); this is an
   explicit, unimplemented stretch goal per the spec, not an oversight.
 - No multi-leg option strategies (spreads, straddles, etc.) — single-leg
   calls/puts only.
-- No persistence of bar, signal, notification, order, or position history
-  (only what's held in memory per backend process, and in each browser's
-  `localStorage`/tab memory). The relative-volume baseline, Telegram's
-  cooldown, and all open/closed positions reset on backend restart for the
-  same reason; the signal toast tray resets on page reload.
+- No true previous-close baseline for the watchlist's "% change today" —
+  see the "Watchlist & portfolio" section's caveat.
+- No persistence of bar, signal, notification, order, position, or
+  portfolio history (only what's held in memory per backend process, and in
+  each browser's `localStorage`/tab memory). The relative-volume baseline,
+  Telegram's cooldown, and all open/closed positions reset on backend
+  restart for the same reason; the signal toast tray resets on page reload.
 - Browser push notifications need the tab open (even if unfocused/backgrounded)
   — reaching you with the tab or browser fully closed is what the optional
   Telegram integration is for, not the Notifications API.

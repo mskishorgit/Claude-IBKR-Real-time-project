@@ -1,4 +1,7 @@
 import type {
+  AccountOptionPositionData,
+  AccountPositionData,
+  AccountSummaryData,
   OptionPositionData,
   OptionQuoteData,
   OptionRight,
@@ -153,4 +156,17 @@ export async function closeOptionPosition(positionId: string): Promise<{ order_i
     { method: "POST" },
     "Failed to close position",
   );
+}
+
+// --- Portfolio ------------------------------------------------------------
+
+export async function getPortfolioPositions(): Promise<{
+  positions: AccountPositionData[];
+  option_positions: AccountOptionPositionData[];
+}> {
+  return requestJson("/api/portfolio/positions", {}, "Failed to load portfolio positions");
+}
+
+export async function getPortfolioSummary(): Promise<AccountSummaryData> {
+  return requestJson("/api/portfolio/summary", {}, "Failed to load account summary");
 }

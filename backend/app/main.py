@@ -9,6 +9,8 @@ from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, field_validator
 
+from .account.models import AccountSummary
+from .account.portfolio import AnyPosition, PortfolioService
 from .config import get_settings
 from .ibkr.connection import ConnectionState, IBKRConnectionManager
 from .ibkr.market_data import MarketDataManager, TickerAlreadyTracked
@@ -173,6 +175,32 @@ def _on_pending_tickers(tickers) -> None:
 
 connection_manager.ib.pendingTickersEvent += _on_pending_tickers
 
+# --- Portfolio & account summary ----------------------------------------
+portfolio_service = PortfolioService(connection_manager.ib)
+
+_portfolio_subscribers: list[asyncio.Queue] = []
+
+
+def _broadcast_portfolio(payload: dict) -> None:
+    for queue in list(_portfolio_subscribers):
+        try:
+            queue.put_nowait(payload)
+        except asyncio.QueueFull:
+            logger.warning("Dropping portfolio update for slow WebSocket subscriber")
+
+
+def _on_account_position(position: AnyPosition) -> None:
+    payload_type = "option_position_update" if position.sec_type == "OPT" else "position_update"
+    _broadcast_portfolio({"type": payload_type, **position.to_dict()})
+
+
+def _on_account_summary(summary: AccountSummary) -> None:
+    _broadcast_portfolio({"type": "account_summary", **summary.to_dict()})
+
+
+portfolio_service.add_position_listener(_on_account_position)
+portfolio_service.add_summary_listener(_on_account_summary)
+
 
 def _broadcast_status(state: ConnectionState, error: str | None) -> None:
     payload = {"type": "status", "state": state.value, "error": error}
@@ -183,7 +211,13 @@ def _broadcast_status(state: ConnectionState, error: str | None) -> None:
             logger.warning("Dropping status update for slow WebSocket subscriber")
 
 
+def _on_connection_state_for_portfolio(state: ConnectionState, error: str | None) -> None:
+    if state == ConnectionState.CONNECTED:
+        portfolio_service.start()
+
+
 connection_manager.add_state_listener(_broadcast_status)
+connection_manager.add_state_listener(_on_connection_state_for_portfolio)
 
 
 @asynccontextmanager
@@ -420,6 +454,31 @@ async def close_option_position(position_id: str):
     return {"order_id": trade.order.orderId, "status": trade.orderStatus.status}
 
 
+# --- Portfolio & account summary ----------------------------------------
+
+
+@app.get("/api/portfolio/positions")
+async def get_portfolio_positions():
+    """Live positions straight from IBKR (reqAccountUpdates) — this is
+    everything the account holds, not just what was opened through this
+    app's own options order flow (see /api/options/positions for that).
+    Split into equity/other vs. options since the latter need
+    strike/expiry/greeks the former don't have."""
+    equities = []
+    options = []
+    for position in portfolio_service.list_positions():
+        if position.sec_type == "OPT":
+            options.append(position.to_dict())
+        else:
+            equities.append(position.to_dict())
+    return {"positions": equities, "option_positions": options}
+
+
+@app.get("/api/portfolio/summary")
+async def get_portfolio_summary():
+    return portfolio_service.summary().to_dict()
+
+
 @app.websocket("/ws/bars")
 async def stream_bars(websocket: WebSocket):
     await websocket.accept()
@@ -548,3 +607,44 @@ async def stream_positions(websocket: WebSocket):
         pump_task.cancel()
         if queue in _position_subscribers:
             _position_subscribers.remove(queue)
+
+
+@app.websocket("/ws/portfolio")
+async def stream_portfolio(websocket: WebSocket):
+    """Live IBKR account positions (equity + options, separately) and the
+    account summary strip. Sends a full snapshot of both on connect, then
+    incremental `position_update` / `option_position_update` /
+    `account_summary` messages as IBKR reports changes."""
+    await websocket.accept()
+
+    queue: asyncio.Queue = asyncio.Queue(maxsize=500)
+    _portfolio_subscribers.append(queue)
+
+    equities = []
+    options = []
+    for position in portfolio_service.list_positions():
+        (options if position.sec_type == "OPT" else equities).append(position.to_dict())
+    await websocket.send_json(
+        {
+            "type": "portfolio_snapshot",
+            "positions": equities,
+            "option_positions": options,
+            "summary": portfolio_service.summary().to_dict(),
+        }
+    )
+
+    async def pump() -> None:
+        while True:
+            message = await queue.get()
+            await websocket.send_json(message)
+
+    pump_task = asyncio.create_task(pump())
+    try:
+        while True:
+            await websocket.receive_text()
+    except WebSocketDisconnect:
+        pass
+    finally:
+        pump_task.cancel()
+        if queue in _portfolio_subscribers:
+            _portfolio_subscribers.remove(queue)

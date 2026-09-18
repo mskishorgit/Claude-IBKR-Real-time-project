@@ -1,16 +1,19 @@
 import { useState } from "react";
 import { addTicker, closeOptionPosition, removeTicker } from "./api";
+import { AccountSummaryStrip } from "./components/AccountSummaryStrip";
 import { BarTable } from "./components/BarTable";
 import { ConnectionStatus } from "./components/ConnectionStatus";
 import { LiveChartPanel } from "./components/LiveChartPanel";
 import { NotificationSettingsPanel } from "./components/NotificationSettingsPanel";
 import { OptionsPanel } from "./components/OptionsPanel";
+import { PortfolioTable } from "./components/PortfolioTable";
 import { SignalAlertTray } from "./components/SignalAlertTray";
-import { TickerControls } from "./components/TickerControls";
 import { TradingModeBanner } from "./components/TradingModeBanner";
+import { WatchlistGrid } from "./components/WatchlistGrid";
 import { useBackendSocket } from "./useBackendSocket";
 import { useNotificationCenter } from "./useNotificationCenter";
 import { useOptionsChainStream } from "./useOptionsChainStream";
+import { usePortfolioStream } from "./usePortfolioStream";
 import { usePositionsStream } from "./usePositionsStream";
 import { useSignalStream } from "./useSignalStream";
 import { useTradingSafety } from "./useTradingSafety";
@@ -24,6 +27,7 @@ function App() {
   const tradingSafety = useTradingSafety();
   const { quotesByKey } = useOptionsChainStream();
   const { positions } = usePositionsStream();
+  const portfolio = usePortfolioStream();
 
   const [selectedSymbol, setSelectedSymbol] = useState<string | null>(null);
 
@@ -48,6 +52,28 @@ function App() {
       />
       {tradingSafety.error && <p className="text-sm text-red-400">{tradingSafety.error}</p>}
 
+      <section className="flex flex-col gap-3 rounded-lg border border-slate-800 p-4">
+        <h2 className="text-sm font-medium text-slate-300">Account summary</h2>
+        <AccountSummaryStrip summary={portfolio.summary} />
+      </section>
+
+      <section className="flex flex-col gap-3 rounded-lg border border-slate-800 p-4">
+        <h2 className="text-sm font-medium text-slate-300">Watchlist</h2>
+        <WatchlistGrid
+          tickers={tickers}
+          barsBySymbol={barsBySymbol}
+          signals={signals}
+          selectedSymbol={selectedSymbol}
+          onSelectSymbol={setSelectedSymbol}
+          onAdd={async (symbol) => {
+            await addTicker(symbol);
+          }}
+          onRemove={async (symbol) => {
+            await removeTicker(symbol);
+          }}
+        />
+      </section>
+
       <LiveChartPanel
         tickers={tickers}
         barsBySymbol={barsBySymbol}
@@ -65,15 +91,11 @@ function App() {
       />
 
       <section className="flex flex-col gap-3 rounded-lg border border-slate-800 p-4">
-        <h2 className="text-sm font-medium text-slate-300">Tracked tickers</h2>
-        <TickerControls
-          tickers={tickers}
-          onAdd={async (symbol) => {
-            await addTicker(symbol);
-          }}
-          onRemove={async (symbol) => {
-            await removeTicker(symbol);
-          }}
+        <h2 className="text-sm font-medium text-slate-300">Portfolio</h2>
+        <PortfolioTable
+          positions={portfolio.positions}
+          optionPositions={portfolio.optionPositions}
+          summary={portfolio.summary}
         />
       </section>
 

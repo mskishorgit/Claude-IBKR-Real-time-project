@@ -139,3 +139,62 @@ export type PositionsServerMessage =
   | PositionUpdateMessage
   | StopTargetAlertMessage
   | PositionsSnapshotMessage;
+
+// --- Portfolio & account summary --------------------------------------------
+
+export interface AccountPositionData {
+  con_id: number;
+  symbol: string;
+  sec_type: string;
+  exchange: string;
+  currency: string;
+  quantity: number;
+  avg_cost: number;
+  market_price: number;
+  market_value: number;
+  unrealized_pnl: number;
+  realized_pnl: number;
+}
+
+export interface AccountOptionPositionData extends AccountPositionData {
+  expiry: string;
+  strike: number;
+  right: OptionRight;
+  delta: number | null;
+  implied_vol: number | null;
+  underlying_price: number | null;
+}
+
+export interface AccountSummaryData {
+  account: string;
+  net_liquidation: number | null;
+  buying_power: number | null;
+  total_cash_value: number | null;
+  realized_pnl: number | null;
+  unrealized_pnl: number | null;
+}
+
+export interface AccountPositionUpdateMessage extends AccountPositionData {
+  type: "position_update";
+}
+
+export interface AccountOptionPositionUpdateMessage extends AccountOptionPositionData {
+  type: "option_position_update";
+}
+
+export interface AccountSummaryMessage extends AccountSummaryData {
+  type: "account_summary";
+}
+
+export interface PortfolioSnapshotMessage {
+  type: "portfolio_snapshot";
+  positions: AccountPositionData[];
+  option_positions: AccountOptionPositionData[];
+  summary: AccountSummaryData;
+}
+
+export type PortfolioServerMessage =
+  | AccountPositionUpdateMessage
+  | AccountOptionPositionUpdateMessage
+  | AccountSummaryMessage
+  | PortfolioSnapshotMessage;
