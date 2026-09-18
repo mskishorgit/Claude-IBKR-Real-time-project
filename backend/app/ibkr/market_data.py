@@ -1,0 +1,157 @@
+"""Real-time 1-minute bar streaming for a runtime-configurable ticker list.
+
+Uses reqHistoricalData(..., keepUpToDate=True) rather than reqRealTimeBars,
+because reqRealTimeBars only ever delivers 5-second bars — keepUpToDate
+historical bars are the documented way to get a live-updating 1-minute bar
+from ib_async/ib_insync.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import logging
+from typing import Optional
+
+from ib_async import IB, Stock
+
+logger = logging.getLogger(__name__)
+
+# IB API error codes that mean "no live market data subscription for this
+# contract" (delayed data may still work) rather than a connectivity problem.
+MARKET_DATA_SUBSCRIPTION_CODES = {354, 10167, 10197, 10225}
+# "No security definition has been found for the request"
+NO_CONTRACT_FOUND_CODE = 200
+
+
+class TickerAlreadyTracked(Exception):
+    pass
+
+
+class MarketDataManager:
+    def __init__(self, ib: IB) -> None:
+        self.ib = ib
+        self._bars: dict[str, "object"] = {}
+        self._lock = asyncio.Lock()
+        self._subscriber_queues: list[asyncio.Queue] = []
+
+        self.ib.errorEvent += self._on_error
+
+    # -- public API ---------------------------------------------------
+
+    def list_tickers(self) -> list[str]:
+        return sorted(self._bars.keys())
+
+    def subscribe(self) -> asyncio.Queue:
+        queue: asyncio.Queue = asyncio.Queue(maxsize=1000)
+        self._subscriber_queues.append(queue)
+        return queue
+
+    def unsubscribe(self, queue: asyncio.Queue) -> None:
+        if queue in self._subscriber_queues:
+            self._subscriber_queues.remove(queue)
+
+    async def add_ticker(self, symbol: str) -> None:
+        symbol = symbol.strip().upper()
+        if not symbol:
+            raise ValueError("Ticker symbol cannot be empty")
+
+        async with self._lock:
+            if symbol in self._bars:
+                raise TickerAlreadyTracked(f"{symbol} is already tracked")
+            if not self.ib.isConnected():
+                raise RuntimeError("Not connected to IBKR TWS/Gateway")
+
+            contract = Stock(symbol, "SMART", "USD")
+            qualified = await self.ib.qualifyContractsAsync(contract)
+            if not qualified:
+                raise ValueError(f"IBKR could not resolve a contract for '{symbol}'")
+
+            bars = await self.ib.reqHistoricalDataAsync(
+                contract,
+                endDateTime="",
+                durationStr="1800 S",
+                barSizeSetting="1 min",
+                whatToShow="TRADES",
+                useRTH=False,
+                formatDate=2,
+                keepUpToDate=True,
+            )
+            bars.updateEvent += self._make_bar_handler(symbol)
+            self._bars[symbol] = bars
+
+            for bar in bars:
+                self._broadcast(self._bar_payload(symbol, bar))
+
+            logger.info("Subscribed to 1-min bars for %s", symbol)
+
+        self._broadcast_tickers()
+
+    async def remove_ticker(self, symbol: str) -> None:
+        symbol = symbol.strip().upper()
+        async with self._lock:
+            bars = self._bars.pop(symbol, None)
+            if bars is not None:
+                self.ib.cancelHistoricalData(bars)
+                logger.info("Unsubscribed from 1-min bars for %s", symbol)
+        self._broadcast_tickers()
+
+    # -- internals ------------------------------------------------------
+
+    def _make_bar_handler(self, symbol: str):
+        def handler(bars, has_new_bar: bool) -> None:
+            if not has_new_bar or not bars:
+                return
+            self._broadcast(self._bar_payload(symbol, bars[-1]))
+
+        return handler
+
+    @staticmethod
+    def _bar_payload(symbol: str, bar) -> dict:
+        timestamp = bar.date.isoformat() if hasattr(bar.date, "isoformat") else str(bar.date)
+        return {
+            "type": "bar",
+            "symbol": symbol,
+            "timestamp": timestamp,
+            "open": bar.open,
+            "high": bar.high,
+            "low": bar.low,
+            "close": bar.close,
+            "volume": bar.volume,
+        }
+
+    def _broadcast_tickers(self) -> None:
+        self._broadcast({"type": "tickers", "tickers": self.list_tickers()})
+
+    def _broadcast(self, payload: dict) -> None:
+        for queue in list(self._subscriber_queues):
+            try:
+                queue.put_nowait(payload)
+            except asyncio.QueueFull:
+                logger.warning("Dropping message for slow WebSocket subscriber")
+
+    def _on_error(self, reqId, errorCode, errorString, contract=None) -> None:  # noqa: N803
+        symbol: Optional[str] = getattr(contract, "symbol", None)
+
+        if errorCode in MARKET_DATA_SUBSCRIPTION_CODES:
+            self._broadcast(
+                {
+                    "type": "ticker_error",
+                    "symbol": symbol,
+                    "code": errorCode,
+                    "message": (
+                        f"No live market data subscription for {symbol or 'this contract'} "
+                        f"(IB error {errorCode}: {errorString}). Bars may be delayed or "
+                        "missing until a market data subscription is added in IBKR "
+                        "Account Management."
+                    ),
+                }
+            )
+        elif errorCode == NO_CONTRACT_FOUND_CODE:
+            self._broadcast(
+                {
+                    "type": "ticker_error",
+                    "symbol": symbol,
+                    "code": errorCode,
+                    "message": f"IBKR could not find a contract for {symbol or reqId}: {errorString}",
+                }
+            )
