@@ -1,14 +1,15 @@
 # Scalp Dashboard
 
 A full-stack project for building a live scalping dashboard on top of Interactive
-Brokers TWS/Gateway. **This first step only proves the data pipeline**: IBKR →
-FastAPI backend → WebSocket → React frontend, rendered as a raw table. There is
-no charting or strategy logic yet.
+Brokers TWS/Gateway: IBKR → FastAPI backend → WebSocket → React frontend, with a
+live-updating candlestick chart. There is no strategy/signal logic or order
+placement yet — this is the live market-data pipeline and charting layer it will
+sit on top of.
 
 ```
 scalp-dashboard/
 ├── backend/    FastAPI + ib_async, connects to TWS/IB Gateway and streams bars
-└── frontend/   React + TypeScript + Vite + Tailwind, shows the raw feed
+└── frontend/   React + TypeScript + Vite + Tailwind + lightweight-charts
 ```
 
 ## 1. Start TWS or IB Gateway in paper trading mode
@@ -128,8 +129,28 @@ Open the printed local URL (default `http://localhost:5173`). You should see:
 - A connection status pill (connected / connecting / reconnecting /
   disconnected) reflecting the backend's live IBKR connection state, with the
   underlying error message shown underneath when disconnected.
+- A live candlestick chart (with a volume pane below it) for the selected
+  ticker, updating in real time as new bars stream in over the same
+  WebSocket. Tabs above the chart switch symbols without reconnecting.
+- VWAP, EMA(9), and EMA(20) overlays, each independently toggleable.
+- A dashed live price line on the chart tracking the latest close.
 - A ticker control box to add/remove symbols at runtime.
-- A raw table of incoming 1-minute bars as they stream in.
+- A collapsible raw table of incoming 1-minute bars, for confirming the pipe
+  itself still works independent of the chart.
+
+### The chart component
+
+`frontend/src/components/CandlestickChart.tsx` is a standalone, reusable
+component — it only needs `symbol` and an ascending, per-symbol `bars` array;
+it doesn't know about the WebSocket or REST layer. It accepts `height`,
+`showVolume`, `overlays` (`{ vwap, ema9, ema20 }`), and a `compact` flag that
+trims axes/labels for small tiles. This is meant to be dropped into a future
+watchlist grid of several small charts without changes.
+
+Indicators (`frontend/src/indicators.ts`) are computed client-side from the
+bars already held in the browser (`useBackendSocket`'s `barsBySymbol`), not
+by the backend — VWAP resets at each UTC calendar day boundary as an
+approximation of a trading session.
 
 ### Frontend environment variables (`frontend/.env`)
 
@@ -147,11 +168,12 @@ same API, so `from ib_async import IB, Stock` is a drop-in replacement for
 
 ## What's not in this step
 
-- No charting.
+- No watchlist grid of multiple charts at once (the chart component is built
+  to support this next, but the UI only shows one at a time so far).
 - No strategy/signal logic.
 - No order placement.
-- No persistence of bar history (only what's held in memory since the
-  backend started, plus whatever IBKR returns for the initial lookback
-  window).
+- No persistence of bar history (only what's held in memory per browser tab
+  and per backend process since they started, plus whatever IBKR returns for
+  the initial lookback window).
 
 These come in later steps, on top of this working data pipeline.

@@ -6,8 +6,11 @@ const WS_URL = import.meta.env.VITE_BACKEND_WS_URL ?? "ws://localhost:8000/ws/ba
 export type SocketState = "connecting" | "open" | "reconnecting";
 
 const MAX_BARS = 200;
+const MAX_BARS_PER_SYMBOL = 500;
 const MAX_TICKER_ERRORS = 20;
 const RECONNECT_DELAY_MS = 3000;
+
+export type BarsBySymbol = Record<string, BarMessage[]>;
 
 export function useBackendSocket() {
   const [socketState, setSocketState] = useState<SocketState>("connecting");
@@ -15,6 +18,7 @@ export function useBackendSocket() {
   const [ibkrError, setIbkrError] = useState<string | null>(null);
   const [tickers, setTickers] = useState<string[]>([]);
   const [bars, setBars] = useState<BarMessage[]>([]);
+  const [barsBySymbol, setBarsBySymbol] = useState<BarsBySymbol>({});
   const [tickerErrors, setTickerErrors] = useState<TickerErrorMessage[]>([]);
 
   const reconnectTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -45,11 +49,35 @@ export function useBackendSocket() {
             setIbkrState(message.state);
             setIbkrError(message.error);
             break;
-          case "tickers":
-            setTickers(message.tickers);
+          case "tickers": {
+            const nextTickers = message.tickers;
+            setTickers(nextTickers);
+            const tickerSet = new Set(nextTickers);
+            setBarsBySymbol((prev) => {
+              const next: BarsBySymbol = {};
+              for (const symbol of Object.keys(prev)) {
+                if (tickerSet.has(symbol)) next[symbol] = prev[symbol];
+              }
+              return next;
+            });
             break;
+          }
           case "bar":
             setBars((prev) => [message, ...prev].slice(0, MAX_BARS));
+            setBarsBySymbol((prev) => {
+              const existing = prev[message.symbol] ?? [];
+              const last = existing[existing.length - 1];
+              let updated: BarMessage[];
+              if (last && last.timestamp === message.timestamp) {
+                updated = existing.slice(0, -1).concat(message);
+              } else {
+                updated = existing.concat(message);
+                if (updated.length > MAX_BARS_PER_SYMBOL) {
+                  updated = updated.slice(updated.length - MAX_BARS_PER_SYMBOL);
+                }
+              }
+              return { ...prev, [message.symbol]: updated };
+            });
             break;
           case "ticker_error":
             setTickerErrors((prev) => [message, ...prev].slice(0, MAX_TICKER_ERRORS));
@@ -78,5 +106,5 @@ export function useBackendSocket() {
     };
   }, []);
 
-  return { socketState, ibkrState, ibkrError, tickers, bars, tickerErrors };
+  return { socketState, ibkrState, ibkrError, tickers, bars, barsBySymbol, tickerErrors };
 }
