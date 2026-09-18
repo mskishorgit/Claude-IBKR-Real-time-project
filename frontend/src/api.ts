@@ -4,6 +4,7 @@ import type {
   AccountSummaryData,
   DayPnlData,
   JournalTradeData,
+  KillSwitchEngageResult,
   MonthStatsData,
   OptionPositionData,
   OptionQuoteData,
@@ -65,6 +66,22 @@ export async function setLiveTradingArmed(armed: boolean): Promise<TradingSafety
     "/api/trading-safety/arm",
     { method: "POST", headers: JSON_HEADERS, body: JSON.stringify({ armed }) },
     "Failed to update live-trading arming",
+  );
+}
+
+export async function engageKillSwitch(): Promise<KillSwitchEngageResult> {
+  return requestJson(
+    "/api/trading-safety/kill-switch/engage",
+    { method: "POST" },
+    "Failed to engage kill switch",
+  );
+}
+
+export async function resetKillSwitch(): Promise<TradingSafetyStatus> {
+  return requestJson(
+    "/api/trading-safety/kill-switch/reset",
+    { method: "POST" },
+    "Failed to reset kill switch",
   );
 }
 

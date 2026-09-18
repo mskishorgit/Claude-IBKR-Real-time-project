@@ -16,6 +16,7 @@ from .account.portfolio import AnyPosition, PortfolioService
 from .config import get_settings
 from .ibkr.connection import ConnectionState, IBKRConnectionManager
 from .ibkr.market_data import MarketDataManager, TickerAlreadyTracked
+from .ibkr.rate_limiter import AsyncRateLimiter
 from .journal.db import JournalStore
 from .journal.execution_sync import ExecutionSyncService
 from .journal.models import JournalTrade, SignalLogEntry
@@ -28,7 +29,7 @@ from .options.orders import (
     PreviewNotFoundError,
 )
 from .options.positions import PositionManager
-from .options.safety import LiveTradingNotArmedError, TradingSafety
+from .options.safety import KillSwitchService, LiveTradingNotArmedError, TradingHaltedError, TradingSafety
 from .signals.factory import build_default_engine
 from .signals.models import Bar, Signal
 
@@ -44,7 +45,23 @@ connection_manager = IBKRConnectionManager(
     reconnect_delay=settings.ibkr_reconnect_delay_seconds,
     heartbeat_interval=settings.ibkr_heartbeat_interval_seconds,
 )
-market_data_manager = MarketDataManager(connection_manager.ib)
+# Two shared limiters guard every pacing-sensitive IBKR call in this app
+# (see app/ibkr/rate_limiter.py): a dedicated one for historical-data
+# requests (IBKR's own documented 6-per-2s rule), and one shared "general"
+# limiter for everything else data-related (reqMktData, qualifyContracts,
+# reqSecDefOptParams, reqExecutions) so their *combined* rate across every
+# subsystem — not each one independently — stays under IBKR's guidance.
+# Deliberately never applied to placeOrder/cancelOrder/reqGlobalCancel.
+historical_rate_limiter = AsyncRateLimiter(
+    max_calls=settings.ibkr_historical_rate_limit_max_calls,
+    per_seconds=settings.ibkr_historical_rate_limit_per_seconds,
+)
+general_rate_limiter = AsyncRateLimiter(
+    max_calls=settings.ibkr_general_rate_limit_max_calls,
+    per_seconds=settings.ibkr_general_rate_limit_per_seconds,
+)
+
+market_data_manager = MarketDataManager(connection_manager.ib, historical_rate_limiter)
 
 signal_engine = build_default_engine(
     vwap_reclaim_enabled=settings.signals_vwap_reclaim_enabled,
@@ -83,7 +100,7 @@ else:
 # --- Trading journal --------------------------------------------------
 journal_store = JournalStore(settings.journal_db_path)
 execution_sync_service = ExecutionSyncService(
-    connection_manager.ib, journal_store, settings.journal_sync_interval_seconds
+    connection_manager.ib, journal_store, settings.journal_sync_interval_seconds, general_rate_limiter
 )
 
 _status_subscribers: list[asyncio.Queue] = []
@@ -152,10 +169,13 @@ market_data_manager.add_ticker_removed_listener(signal_engine.reset_symbol)
 # that must also be true before a *live* order can go through. See
 # app/options/safety.py for exactly what this does and doesn't protect.
 trading_safety = TradingSafety(trading_mode=settings.ibkr_trading_mode)
-options_chain_service = OptionsChainService(connection_manager.ib, market_data_manager.get_last_price)
+kill_switch_service = KillSwitchService(connection_manager.ib, trading_safety)
+options_chain_service = OptionsChainService(
+    connection_manager.ib, market_data_manager.get_last_price, general_rate_limiter
+)
 position_manager = PositionManager(connection_manager.ib)
 options_order_service = OptionsOrderService(
-    connection_manager.ib, options_chain_service, position_manager, trading_safety
+    connection_manager.ib, options_chain_service, position_manager, trading_safety, general_rate_limiter
 )
 
 _option_chain_subscribers: list[asyncio.Queue] = []
@@ -225,6 +245,12 @@ def _on_account_position(position: AnyPosition) -> None:
 
 def _on_account_summary(summary: AccountSummary) -> None:
     _broadcast_portfolio({"type": "account_summary", **summary.to_dict()})
+    # The account/mode cross-check (see app/options/safety.py) needs to know
+    # which account IBKR actually connected us to; every account-value
+    # update carries it, so this is the earliest and most reliable place to
+    # learn it — cheap no-op once it's already been recorded once.
+    if summary.account:
+        trading_safety.set_account(summary.account)
 
 
 portfolio_service.add_position_listener(_on_account_position)
@@ -370,9 +396,33 @@ async def set_trading_safety_armed(request: ArmLiveTradingRequest):
             status_code=400,
             detail="Nothing to arm — this backend is connected in paper mode",
         )
+    if request.armed and trading_safety.kill_switch_engaged:
+        raise HTTPException(
+            status_code=423,
+            detail="Kill switch is engaged — reset it before re-arming live trading",
+        )
     trading_safety.set_armed(request.armed)
     if trading_safety.trading_mode == "live":
         logger.warning("LIVE TRADING armed=%s", request.armed)
+    return trading_safety.status()
+
+
+@app.post("/api/trading-safety/kill-switch/engage")
+async def engage_kill_switch():
+    """Cancels every open order at the IBKR level (reqGlobalCancel — all
+    working orders on the account, not just ones this app placed) and
+    blocks all new order submission until reset. Always succeeds locally
+    (flips the flag) even if IBKR is unreachable; `ibkr_reachable` in the
+    response says whether the cancel actually reached IBKR."""
+    result = kill_switch_service.engage()
+    return {**trading_safety.status(), **result}
+
+
+@app.post("/api/trading-safety/kill-switch/reset")
+async def reset_kill_switch():
+    """Only lifts the order-submission block — live trading (if
+    applicable) still needs to be re-armed separately via /arm."""
+    kill_switch_service.reset()
     return trading_safety.status()
 
 
@@ -466,6 +516,8 @@ async def create_order_preview(request: OrderPreviewRequest):
             request.stop_loss.to_config() if request.stop_loss else None,
             request.profit_target.to_config() if request.profit_target else None,
         )
+    except TradingHaltedError as exc:
+        raise HTTPException(status_code=423, detail=str(exc)) from exc
     except LiveTradingNotArmedError as exc:
         raise HTTPException(status_code=403, detail=str(exc)) from exc
     except OrderValidationError as exc:
@@ -480,6 +532,8 @@ async def confirm_order(preview_id: str):
         trade = await options_order_service.confirm_order(preview_id)
     except PreviewNotFoundError as exc:
         raise HTTPException(status_code=410, detail=str(exc)) from exc
+    except TradingHaltedError as exc:
+        raise HTTPException(status_code=423, detail=str(exc)) from exc
     except LiveTradingNotArmedError as exc:
         raise HTTPException(status_code=403, detail=str(exc)) from exc
     return {"order_id": trade.order.orderId, "status": trade.orderStatus.status}
@@ -503,6 +557,8 @@ async def close_option_position(position_id: str):
     _require_ibkr_connected()
     try:
         trade = await options_order_service.close_position(position_id)
+    except TradingHaltedError as exc:
+        raise HTTPException(status_code=423, detail=str(exc)) from exc
     except LiveTradingNotArmedError as exc:
         raise HTTPException(status_code=403, detail=str(exc)) from exc
     except OrderValidationError as exc:

@@ -1,16 +1,21 @@
 import { useState } from "react";
 import { addTicker, closeOptionPosition, removeTicker } from "./api";
+import { AccountMismatchBanner } from "./components/AccountMismatchBanner";
 import { AccountSummaryStrip } from "./components/AccountSummaryStrip";
 import { BarTable } from "./components/BarTable";
 import { ConnectionStatus } from "./components/ConnectionStatus";
 import { JournalPanel } from "./components/JournalPanel";
+import { KillSwitchControl } from "./components/KillSwitchControl";
 import { LiveChartPanel } from "./components/LiveChartPanel";
 import { NotificationSettingsPanel } from "./components/NotificationSettingsPanel";
 import { OptionsPanel } from "./components/OptionsPanel";
 import { PortfolioTable } from "./components/PortfolioTable";
 import { SignalAlertTray } from "./components/SignalAlertTray";
+import { StaleBadge } from "./components/StaleBadge";
+import { StaleDataBanner } from "./components/StaleDataBanner";
 import { TradingModeBanner } from "./components/TradingModeBanner";
 import { WatchlistGrid } from "./components/WatchlistGrid";
+import { isDataStale } from "./dataFreshness";
 import { useBackendSocket } from "./useBackendSocket";
 import { useJournalStream } from "./useJournalStream";
 import { useNotificationCenter } from "./useNotificationCenter";
@@ -27,12 +32,22 @@ function App() {
   const { settings, setSettings, toasts, dismissToast, permission, requestPermission } =
     useNotificationCenter(signals);
   const tradingSafety = useTradingSafety();
-  const { quotesByKey } = useOptionsChainStream();
-  const { positions } = usePositionsStream();
+  const { quotesByKey, socketState: optionsSocketState } = useOptionsChainStream();
+  const { positions, socketState: positionsSocketState } = usePositionsStream();
   const portfolio = usePortfolioStream();
   const { version: journalVersion } = useJournalStream();
 
   const [selectedSymbol, setSelectedSymbol] = useState<string | null>(null);
+
+  // Whether anything currently on screen could be frozen rather than live —
+  // see dataFreshness.ts. Drives both the page-level banner and dimming the
+  // individual price/position sections below.
+  const dataStale = isDataStale(ibkrState, [
+    socketState,
+    portfolio.socketState,
+    positionsSocketState,
+    optionsSocketState,
+  ]);
 
   return (
     <div className="mx-auto flex min-h-svh max-w-5xl flex-col gap-6 px-4 py-8">
@@ -48,6 +63,18 @@ function App() {
         <ConnectionStatus socketState={socketState} ibkrState={ibkrState} ibkrError={ibkrError} />
       </header>
 
+      <StaleDataBanner ibkrState={ibkrState} ibkrError={ibkrError} backendReachable={socketState === "open"} />
+
+      <KillSwitchControl
+        status={tradingSafety.status}
+        pending={tradingSafety.pending}
+        lastResult={tradingSafety.lastKillSwitchResult}
+        onEngage={tradingSafety.engageKillSwitch}
+        onReset={tradingSafety.resetKillSwitch}
+      />
+
+      <AccountMismatchBanner status={tradingSafety.status} />
+
       <TradingModeBanner
         status={tradingSafety.status}
         pending={tradingSafety.pending}
@@ -55,13 +82,19 @@ function App() {
       />
       {tradingSafety.error && <p className="text-sm text-red-400">{tradingSafety.error}</p>}
 
-      <section className="flex flex-col gap-3 rounded-lg border border-slate-800 p-4">
-        <h2 className="text-sm font-medium text-slate-300">Account summary</h2>
+      <section className={`flex flex-col gap-3 rounded-lg border border-slate-800 p-4 ${dataStale ? "opacity-60" : ""}`}>
+        <h2 className="flex items-center gap-2 text-sm font-medium text-slate-300">
+          Account summary
+          {dataStale && <StaleBadge />}
+        </h2>
         <AccountSummaryStrip summary={portfolio.summary} />
       </section>
 
-      <section className="flex flex-col gap-3 rounded-lg border border-slate-800 p-4">
-        <h2 className="text-sm font-medium text-slate-300">Watchlist</h2>
+      <section className={`flex flex-col gap-3 rounded-lg border border-slate-800 p-4 ${dataStale ? "opacity-60" : ""}`}>
+        <h2 className="flex items-center gap-2 text-sm font-medium text-slate-300">
+          Watchlist
+          {dataStale && <StaleBadge />}
+        </h2>
         <WatchlistGrid
           tickers={tickers}
           barsBySymbol={barsBySymbol}
@@ -77,12 +110,14 @@ function App() {
         />
       </section>
 
-      <LiveChartPanel
-        tickers={tickers}
-        barsBySymbol={barsBySymbol}
-        selectedSymbol={selectedSymbol}
-        onSelectSymbol={setSelectedSymbol}
-      />
+      <div className={dataStale ? "opacity-60" : ""}>
+        <LiveChartPanel
+          tickers={tickers}
+          barsBySymbol={barsBySymbol}
+          selectedSymbol={selectedSymbol}
+          onSelectSymbol={setSelectedSymbol}
+        />
+      </div>
 
       <OptionsPanel
         symbol={selectedSymbol}
@@ -93,8 +128,11 @@ function App() {
         }}
       />
 
-      <section className="flex flex-col gap-3 rounded-lg border border-slate-800 p-4">
-        <h2 className="text-sm font-medium text-slate-300">Portfolio</h2>
+      <section className={`flex flex-col gap-3 rounded-lg border border-slate-800 p-4 ${dataStale ? "opacity-60" : ""}`}>
+        <h2 className="flex items-center gap-2 text-sm font-medium text-slate-300">
+          Portfolio
+          {dataStale && <StaleBadge />}
+        </h2>
         <PortfolioTable
           positions={portfolio.positions}
           optionPositions={portfolio.optionPositions}

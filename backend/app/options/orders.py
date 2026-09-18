@@ -26,6 +26,7 @@ from typing import Literal, Optional
 
 from ib_async import IB, LimitOrder, MarketOrder, Trade
 
+from ..ibkr.rate_limiter import AsyncRateLimiter
 from .chain import OptionsChainService
 from .models import Action, OptionContractKey, OrderType, PendingOrder, StopTargetConfig
 from .positions import PositionManager
@@ -56,12 +57,14 @@ class OptionsOrderService:
         chain_service: OptionsChainService,
         position_manager: PositionManager,
         safety: TradingSafety,
+        rate_limiter: Optional[AsyncRateLimiter] = None,
     ) -> None:
         self.ib = ib
         self.chain_service = chain_service
         self.position_manager = position_manager
         self.safety = safety
         self._pending_previews: dict[str, PendingOrder] = {}
+        self._rate_limiter = rate_limiter or AsyncRateLimiter(max_calls=30, per_seconds=1.0)
 
     def get_preview(self, preview_id: str) -> Optional[PendingOrder]:
         return self._pending_previews.get(preview_id)
@@ -134,6 +137,7 @@ class OptionsOrderService:
             if quote is not None:
                 return quote
 
+        await self._rate_limiter.acquire()
         ticker = self.ib.reqMktData(contract, "", False, False)
         try:
             await asyncio.sleep(QUOTE_WAIT_SECONDS)

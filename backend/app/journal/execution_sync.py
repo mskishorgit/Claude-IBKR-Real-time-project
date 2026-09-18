@@ -25,6 +25,7 @@ from dataclasses import replace
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Callable, Optional
 
+from ..ibkr.rate_limiter import AsyncRateLimiter
 from ..options.models import OptionPosition
 from .db import JournalStore
 from .fifo_matcher import FifoTradeMatcher, RawFill
@@ -45,13 +46,22 @@ TradeListener = Callable[[JournalTrade], None]
 
 
 class ExecutionSyncService:
-    def __init__(self, ib: "IB", store: JournalStore, sync_interval_seconds: float) -> None:
+    def __init__(
+        self,
+        ib: "IB",
+        store: JournalStore,
+        sync_interval_seconds: float,
+        rate_limiter: Optional[AsyncRateLimiter] = None,
+    ) -> None:
         self.ib = ib
         self.store = store
         self.sync_interval_seconds = sync_interval_seconds
         self._matcher = FifoTradeMatcher()
         self._task: Optional[asyncio.Task] = None
         self._trade_listeners: list[TradeListener] = []
+        # Guards against a user mashing the manual "Sync with IBKR" button —
+        # the periodic loop alone would never come close to this limit.
+        self._rate_limiter = rate_limiter or AsyncRateLimiter(max_calls=30, per_seconds=1.0)
 
         self.ib.execDetailsEvent += self._on_exec_details
 
@@ -75,6 +85,7 @@ class ExecutionSyncService:
         repeatedly — `synced_executions` dedupes by execId, so a re-run
         only folds in fills this process hasn't already recorded (e.g. it
         wasn't running yet when they happened, or it just reconnected)."""
+        await self._rate_limiter.acquire()
         fills = await self.ib.reqExecutionsAsync()
         for fill in sorted(fills, key=lambda f: f.execution.time):
             self._ingest_fill(fill)

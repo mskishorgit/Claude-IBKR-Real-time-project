@@ -120,6 +120,11 @@ class PortfolioService:
         contract = item.contract
         if contract.secType == "OPT" and contract.conId not in self._greek_watch:
             self._greek_watch.add(contract.conId)
+            # Not rate-limited (see app/ibkr/rate_limiter.py for what is):
+            # this only ever fires once per *distinct* option conId, ever,
+            # for the life of the process — no realistic trading pace opens
+            # enough distinct option positions per second for this to be the
+            # thing that trips an IBKR pacing violation.
             self.ib.reqMktData(contract, "", False, False)
         self._notify_position(self._to_position(item))
 

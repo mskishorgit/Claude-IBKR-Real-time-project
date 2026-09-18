@@ -15,8 +15,14 @@ from typing import Callable, Optional
 from ib_async import IB, Stock
 
 from ..signals.models import Bar
+from .rate_limiter import AsyncRateLimiter
 
 logger = logging.getLogger(__name__)
+
+# IBKR's own documented historical-data pacing rule: no more than 6
+# requests in any rolling 2-second window. See rate_limiter.py.
+HISTORICAL_RATE_LIMIT_MAX_CALLS = 6
+HISTORICAL_RATE_LIMIT_PER_SECONDS = 2.0
 
 # IB API error codes that mean "no live market data subscription for this
 # contract" (delayed data may still work) rather than a connectivity problem.
@@ -30,13 +36,16 @@ class TickerAlreadyTracked(Exception):
 
 
 class MarketDataManager:
-    def __init__(self, ib: IB) -> None:
+    def __init__(self, ib: IB, historical_rate_limiter: Optional[AsyncRateLimiter] = None) -> None:
         self.ib = ib
         self._bars: dict[str, "object"] = {}
         self._lock = asyncio.Lock()
         self._subscriber_queues: list[asyncio.Queue] = []
         self._bar_closed_listeners: list[Callable[[Bar], None]] = []
         self._ticker_removed_listeners: list[Callable[[str], None]] = []
+        self._historical_rate_limiter = historical_rate_limiter or AsyncRateLimiter(
+            max_calls=HISTORICAL_RATE_LIMIT_MAX_CALLS, per_seconds=HISTORICAL_RATE_LIMIT_PER_SECONDS
+        )
 
         self.ib.errorEvent += self._on_error
 
@@ -88,6 +97,7 @@ class MarketDataManager:
             if not qualified:
                 raise ValueError(f"IBKR could not resolve a contract for '{symbol}'")
 
+            await self._historical_rate_limiter.acquire()
             bars = await self.ib.reqHistoricalDataAsync(
                 contract,
                 endDateTime="",

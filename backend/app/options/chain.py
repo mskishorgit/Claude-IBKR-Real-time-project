@@ -16,6 +16,7 @@ from typing import Callable, Optional
 
 from ib_async import IB, Option, Stock, Ticker
 
+from ..ibkr.rate_limiter import AsyncRateLimiter
 from .models import OptionContractKey, OptionQuote
 from .quotes import quote_from_ticker
 
@@ -24,6 +25,12 @@ logger = logging.getLogger(__name__)
 DEFAULT_STRIKES_EACH_SIDE = 5
 DEFAULT_MAX_DAYS_AHEAD = 7
 MAX_EXPIRIES_RETURNED = 6
+
+# Conservative headroom under IBKR's general ~50 messages/second socket
+# guidance — this is the call site most likely to burst (subscribing a
+# whole chain fires one reqMktData per strike/right, up to ~20+ in a row).
+GENERAL_RATE_LIMIT_MAX_CALLS = 30
+GENERAL_RATE_LIMIT_PER_SECONDS = 1.0
 
 
 class OptionsChainError(Exception):
@@ -48,21 +55,31 @@ def _nearest_strikes(strikes: list[float], price: float, each_side: int) -> list
 
 
 class OptionsChainService:
-    def __init__(self, ib: IB, get_underlying_price: Callable[[str], Optional[float]]) -> None:
+    def __init__(
+        self,
+        ib: IB,
+        get_underlying_price: Callable[[str], Optional[float]],
+        rate_limiter: Optional[AsyncRateLimiter] = None,
+    ) -> None:
         self.ib = ib
         self._get_underlying_price = get_underlying_price
         self._subscriptions: dict[str, _ChainSubscription] = {}
         self._key_by_conid: dict[int, OptionContractKey] = {}
+        self._rate_limiter = rate_limiter or AsyncRateLimiter(
+            max_calls=GENERAL_RATE_LIMIT_MAX_CALLS, per_seconds=GENERAL_RATE_LIMIT_PER_SECONDS
+        )
 
     async def _get_smart_chain(self, symbol: str):
         if not self.ib.isConnected():
             raise OptionsChainError("Not connected to IBKR TWS/Gateway")
         stock = Stock(symbol, "SMART", "USD")
+        await self._rate_limiter.acquire()
         qualified = await self.ib.qualifyContractsAsync(stock)
         if not qualified or qualified[0] is None:
             raise OptionsChainError(f"Could not resolve underlying contract for {symbol}")
         underlying = qualified[0]
 
+        await self._rate_limiter.acquire()
         chains = await self.ib.reqSecDefOptParamsAsync(
             underlying.symbol, "", underlying.secType, underlying.conId
         )
@@ -105,6 +122,7 @@ class OptionsChainService:
             for strike in strikes
             for right in ("C", "P")
         ]
+        await self._rate_limiter.acquire()
         qualified = await self.ib.qualifyContractsAsync(*candidates)
         qualified_contracts = [c for c in qualified if c is not None]
         if not qualified_contracts:
@@ -123,6 +141,7 @@ class OptionsChainService:
             )
             subscription.contracts[key] = contract
             self._key_by_conid[contract.conId] = key
+            await self._rate_limiter.acquire()
             ticker = self.ib.reqMktData(contract, "", False, False)
             quote = quote_from_ticker(ticker, key)
             if quote is not None:
@@ -161,6 +180,7 @@ class OptionsChainService:
         if not self.ib.isConnected():
             raise OptionsChainError("Not connected to IBKR TWS/Gateway")
         option = Option(key.symbol, key.expiry, key.strike, key.right, "SMART", currency="USD")
+        await self._rate_limiter.acquire()
         qualified = await self.ib.qualifyContractsAsync(option)
         if not qualified or qualified[0] is None:
             raise OptionsChainError(f"Could not qualify option contract {key.label()}")

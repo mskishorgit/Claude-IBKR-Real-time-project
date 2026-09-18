@@ -61,6 +61,14 @@ export interface TradingSafetyStatus {
   trading_mode: TradingMode;
   live_armed: boolean;
   live_at_risk: boolean;
+  kill_switch_engaged: boolean;
+  account_id: string | null;
+  account_mode_mismatch: boolean;
+}
+
+export interface KillSwitchEngageResult extends TradingSafetyStatus {
+  cancelled_orders: number;
+  ibkr_reachable: boolean;
 }
 
 export interface OptionQuoteData {

@@ -57,6 +57,15 @@ class Settings(BaseSettings):
     journal_db_path: str = "scalp_journal.db"
     journal_sync_interval_seconds: float = 300.0
 
+    # IBKR pacing limits (see app/ibkr/rate_limiter.py). Historical data
+    # mirrors IBKR's own documented rule (6 requests / 2s); the general
+    # limit covers reqMktData/qualifyContracts/reqSecDefOptParams/
+    # reqExecutions, kept well under IBKR's ~50 messages/second guidance.
+    ibkr_historical_rate_limit_max_calls: int = 6
+    ibkr_historical_rate_limit_per_seconds: float = 2.0
+    ibkr_general_rate_limit_max_calls: int = 30
+    ibkr_general_rate_limit_per_seconds: float = 1.0
+
     @property
     def telegram_enabled(self) -> bool:
         return bool(self.telegram_bot_token and self.telegram_chat_id)

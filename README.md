@@ -9,14 +9,20 @@ option orders through IBKR — paper by default, live gated behind an explicit,
 visible arm switch — a live watchlist/portfolio view pulling the account's
 actual positions and P/L straight from IBKR, and a trading journal with a
 daily P/L calendar backed by a local SQLite database, reconciled
-periodically against IBKR's own execution history. **Read the "Options
+periodically against IBKR's own execution history. A hardening pass added
+an account/mode mismatch check, a global emergency kill switch, a
+stale-data banner for when the IBKR connection drops mid-session, and
+client-side pacing limits on every IBKR data request. **Read the "Options
 trading panel" section before touching that part of the UI against a live
-account.**
+account, and see `RUNBOOK.md` for the short operational version of all of
+this (starting safely, verifying paper mode, switching to live, and using
+the kill switch) before your first live session.**
 
 ```
 scalp-dashboard/
 ├── backend/    FastAPI + ib_async + a rule-based signal engine
-└── frontend/   React + TypeScript + Vite + Tailwind + lightweight-charts
+├── frontend/   React + TypeScript + Vite + Tailwind + lightweight-charts
+└── RUNBOOK.md  Operational safety procedures for running against a live account
 ```
 
 ## 1. Start TWS or IB Gateway in paper trading mode
@@ -87,6 +93,10 @@ silent failure.
 | `CORS_ORIGINS` | `http://localhost:5173` | Allowed frontend origin(s) |
 | `JOURNAL_DB_PATH` | `scalp_journal.db` | SQLite file for the trading journal (relative to `backend/`) |
 | `JOURNAL_SYNC_INTERVAL_SECONDS` | `300` | How often to reconcile against IBKR's execution history |
+| `IBKR_HISTORICAL_RATE_LIMIT_MAX_CALLS` | `6` | Historical-data pacing limit — max requests... |
+| `IBKR_HISTORICAL_RATE_LIMIT_PER_SECONDS` | `2.0` | ...per this many seconds (IBKR's own documented rule) |
+| `IBKR_GENERAL_RATE_LIMIT_MAX_CALLS` | `30` | Shared limit for reqMktData/qualifyContracts/etc — max requests... |
+| `IBKR_GENERAL_RATE_LIMIT_PER_SECONDS` | `1.0` | ...per this many seconds |
 
 See `.env.example` for the signal engine's `SIGNALS_*` variables (one enabled
 flag and its key thresholds per rule) — covered in detail below.
@@ -113,6 +123,10 @@ flag and its key thresholds per rule) — covered in detail below.
 - `GET /api/trading-safety` / `POST /api/trading-safety/arm` `{"armed": bool}`
   — read/set the options panel's live-trading arm switch. See "Options
   trading panel" below.
+- `POST /api/trading-safety/kill-switch/engage` / `POST
+  /api/trading-safety/kill-switch/reset` — the emergency kill switch:
+  cancels every open order at the IBKR level and blocks all new order
+  submission until reset. See "Emergency kill switch" below.
 - `GET /api/options/expiries?symbol=` — near-term (0DTE/weekly) expiries for
   a tracked underlying.
 - `POST /api/options/chain/subscribe` `{"symbol", "expiry"}` /
@@ -288,24 +302,44 @@ market data, order placement).
 
 #### The paper/live safety model
 
-There are two independent things, both must line up before a *live* order
-can go through:
+Four independent things all funnel through the exact same choke point —
+`TradingSafety.check_order_allowed()`, called at the top of every single
+`ib.placeOrder`-adjacent call in this app (preview, confirm, and one-click
+close; verified by grepping for every `placeOrder` call site — there are
+exactly two, both in `app/options/orders.py`, both gated). The first two
+were the original design; the last two were added in a hardening pass
+after an explicit audit of every order-submission path (see `RUNBOOK.md`
+for the operational version of all of this):
 
 1. **`IBKR_TRADING_MODE`** in `.env` — fixed for the backend process's
    lifetime, same variable that already picks the connection port. This is
-   "which account is IBKR actually talking to."
+   "which account is IBKR actually talking to," *according to `.env`.*
 2. **The arm switch** — a runtime-only, in-memory flag (`live_armed`,
    default `False`) toggled from the UI via `POST /api/trading-safety/arm`.
    This is "has a human, right now, explicitly said yes to real orders."
+3. **Account/mode cross-check** (`account_mode_mismatch`) — #1 above is
+   only ever what `.env` *says*; nothing previously verified it against
+   which account IBKR actually connected the process to. A TWS/Gateway port
+   misconfigured so `IBKR_TRADING_MODE=paper` points at a real account
+   would otherwise let "paper" orders hit real money without this app ever
+   noticing. IBKR paper/demo accounts are always `DU`-prefixed; live
+   accounts never are — a mismatch here blocks **every** order, including
+   in paper mode, which previously skipped every check unconditionally.
+   The account id is learned from the first `accountValueEvent` IBKR sends
+   after connecting (see `PortfolioService`), so there's a short window
+   right after startup where this can't yet be evaluated (recorded as
+   "not a mismatch," not "safe" — see `TradingSafety.account_mode_mismatch`).
+4. **The kill switch** (`kill_switch_engaged`) — see "Emergency kill
+   switch" below.
 
-When `IBKR_TRADING_MODE=paper`, every order is inherently safe and the arm
-switch doesn't matter — the frontend shows no banner at all. When it's
-`live`, the UI shows an amber "connected to a LIVE account, orders blocked"
-banner until you arm it, at which point it becomes a bold red "LIVE TRADING
-ARMED" banner that stays up for as long as it's armed. Every order-placing
-call — preview, confirm, and one-click close — checks this gate; arming is
-never implicit and never assumed. **Test the whole flow against a paper
-account first.**
+When `IBKR_TRADING_MODE=paper` *and there's no account mismatch*, an order
+is inherently safe and the frontend shows no banner for #1/#2 at all. When
+it's `live`, the UI shows an amber "connected to a LIVE account, orders
+blocked" banner until you arm it, at which point it becomes a bold red
+"LIVE TRADING ARMED" banner that stays up for as long as it's armed. A
+mismatch (#3) or an engaged kill switch (#4) shows its own banner and
+blocks orders regardless of #1/#2's state. Arming is never implicit and
+never assumed. **Test the whole flow against a paper account first.**
 
 #### The order flow
 
@@ -348,6 +382,34 @@ tick past it. Auto-submitting a bracket order to actually enforce these is
 an explicit stretch goal from the spec that isn't implemented — flagging
 first, reliably, was the priority.
 
+#### Emergency kill switch
+
+A red "🛑 Kill switch" button is always visible near the top of the page
+(both trading modes) — a global panic button, added in the hardening pass.
+Engaging it (`POST /api/trading-safety/kill-switch/engage`, a two-click
+confirm in the UI so it can't fire by accident):
+
+- Cancels every currently open (working, unfilled) order at the IBKR
+  level via `ib.reqGlobalCancel()` — **all** open orders on the account,
+  not just ones this app itself placed — plus an explicit `cancelOrder`
+  per order this process knows about, belt-and-suspenders.
+- Sets `kill_switch_engaged=True`, which `check_order_allowed()` checks
+  *first*, before anything else — blocking every new preview, confirm, and
+  one-click close (yes, including closing a position, which is itself an
+  order) until it's reset.
+- Drops `live_armed` to `False` as part of engaging, so a bare reset can't
+  silently leave live trading armed with no further human action.
+
+It deliberately does **not** close any open position — cancelling a
+resting order and flattening a position are different operations, and
+"cancel all open orders" only ever means the former. `POST
+/api/trading-safety/kill-switch/reset` only lifts the submission block;
+live trading (if applicable) needs a separate re-arm. It engages locally
+(blocking this app's own order submission) even if IBKR is unreachable —
+the response's `ibkr_reachable` field says whether the cancel actually
+reached IBKR or only the local flag flipped. See `RUNBOOK.md` for the
+step-by-step emergency procedure.
+
 #### Options tests
 
 ```bash
@@ -368,7 +430,15 @@ alert latching (fires once, not every tick), and the full preview → confirm
 `ib_async` `Order`/`Trade` objects (so `trade.statusEvent`/`filledEvent`
 behave exactly like production) — including that a preview is rejected the
 second time it's used, and that both `create_preview` and `close_position`
-are blocked when live trading isn't armed.
+are blocked when live trading isn't armed. `test_trading_safety.py`
+additionally covers the hardening-pass additions: the account/mode
+mismatch check in every direction (paper+paper account, paper+live
+account, live+paper account, live+live account), that the kill switch
+blocks orders regardless of trading mode, that engaging it disarms live
+trading, that resetting it does *not* auto-rearm live trading, and
+`KillSwitchService` itself (cancels every open order, still engages
+locally when IBKR is unreachable, reset clears the flag) against a fake
+IBKR client.
 
 ### Watchlist & portfolio
 
@@ -509,6 +579,56 @@ a real `eventkit.Event` for `execDetailsEvent` (same pattern as
 `test_portfolio_service.py`) so live-fill and backfill paths both behave
 exactly like production.
 
+### IBKR pacing limits / rate limiting
+
+IBKR disconnects clients that request data too aggressively. `backend/app/
+ibkr/rate_limiter.py`'s `AsyncRateLimiter` — a small async sliding-window
+limiter (`await limiter.acquire()` blocks, never raises, until it's safe to
+proceed) — throttles every outbound call that could realistically burst:
+
+- **Historical data** (`reqHistoricalDataAsync`, called once per ticker
+  add): capped at 6 requests / 2 seconds, matching IBKR's own documented
+  historical-data pacing rule exactly. A user (or script) adding several
+  tickers back-to-back is the realistic burst case.
+- **Everything else data-related** (`reqMktData`, `qualifyContractsAsync`,
+  `reqSecDefOptParamsAsync`, `reqExecutionsAsync`): one **shared** limiter
+  (default 30 calls/second) injected into `OptionsChainService`,
+  `OptionsOrderService`, and `ExecutionSyncService` from `main.py`, so their
+  *combined* rate is what's capped — not each one independently, which
+  could otherwise stack past IBKR's general ~50-messages/second socket
+  guidance if more than one burst happens at once. Subscribing an options
+  chain is the tightest realistic burst here: up to ~20+ `reqMktData` calls
+  in a row for one `subscribe()` call.
+
+Both limits are configurable (`IBKR_HISTORICAL_RATE_LIMIT_*` /
+`IBKR_GENERAL_RATE_LIMIT_*` in `.env`) — see `.env.example`.
+
+**Deliberately never applied to order placement or any cancellation call**
+(`placeOrder`, `cancelOrder`, `reqGlobalCancel`, `cancelMktData`,
+`cancelHistoricalData`) — an order, and especially an emergency kill-switch
+cancel, must never be delayed by a data-request throttle. One call site
+(`PortfolioService`'s per-option `reqMktData` for greeks) is deliberately
+*not* rate-limited either, with a comment explaining why: it fires at most
+once per distinct option contract ever held, for the life of the process —
+no realistic trading pace opens enough distinct option positions per
+second for that to be the thing that trips a pacing violation.
+
+This is a client-side courtesy limiter, not a guarantee IBKR won't ever
+pace-violate for other reasons (e.g. exceeding the account's concurrent
+market-data-line entitlement) — see `RUNBOOK.md` if it happens anyway.
+
+```bash
+cd backend
+source .venv/bin/activate
+python -m pytest tests/test_rate_limiter.py -v
+```
+
+Covers the limiter in isolation: calls within the limit never wait, a call
+over the limit waits exactly long enough for the window to clear (verified
+with a monkeypatched clock, not real sleeps), concurrent callers are
+serialized through the same window rather than each getting their own
+budget, and non-positive configuration is rejected.
+
 ### Common error states
 
 The backend is built to surface these clearly instead of failing silently:
@@ -544,6 +664,21 @@ Open the printed local URL (default `http://localhost:5173`). You should see:
 - A connection status pill (connected / connecting / reconnecting /
   disconnected) reflecting the backend's live IBKR connection state, with the
   underlying error message shown underneath when disconnected.
+- An always-visible **🛑 Kill switch** button (see the backend's "Emergency
+  kill switch" section above) — a two-click confirm, then a red "KILL
+  SWITCH ENGAGED" banner with a "Reset kill switch" button.
+- An **account/mode mismatch banner** (red, unmissable) if the account
+  IBKR actually connected to doesn't match `IBKR_TRADING_MODE` — see the
+  backend's "paper/live safety model" above. All orders are already
+  blocked server-side while this shows; the banner exists so a human
+  notices immediately rather than discovering it from a failed order.
+- A **stale-data banner** (amber) whenever this browser tab loses its
+  WebSocket to the backend, or the backend loses its connection to IBKR —
+  added in a hardening pass so a frozen price/position/P&L can never keep
+  looking live with nothing on screen saying otherwise. Every affected
+  section (account summary, watchlist, chart, portfolio) additionally dims
+  and shows a small "STALE" tag next to its heading for the same reason,
+  localized to where the frozen numbers actually are.
 - An **account summary strip**: net liquidation, buying power, and day
   realized/unrealized P/L, refreshing live.
 - A **watchlist grid**: compact tiles per tracked ticker with last price,
@@ -584,6 +719,41 @@ Open the printed local URL (default `http://localhost:5173`). You should see:
   details for options, P/L, and the scalping rule (if any) that triggered
   the entry. A "Sync with IBKR" button pulls the latest execution history
   immediately on top of the automatic periodic reconciliation.
+
+### Reconnection & stale data
+
+Two separate connections can each drop independently, and previously
+neither one showing "disconnected" changed how any price/position/P&L was
+rendered — the last values just sat there, indistinguishable from live
+ones. This was hardened as follows:
+
+- `frontend/src/useBackendSocket.ts` (and every other WebSocket hook —
+  `usePortfolioStream`, `usePositionsStream`, `useOptionsChainStream`,
+  `useJournalStream`) already reconnects automatically on close with a
+  fixed delay; that part was fine. What was missing was surfacing it.
+- `frontend/src/dataFreshness.ts`'s `isDataStale(ibkrState, socketStates)`
+  is the single source of truth: true if the backend's own IBKR connection
+  isn't `"connected"`, *or* any of this tab's WebSocket connections to the
+  backend aren't `"open"`. `App.tsx` computes this once from every socket
+  state it holds and threads it into `StaleDataBanner` (page-level) and a
+  `dataStale`-driven dim + `StaleBadge` on the account summary, watchlist,
+  chart, and portfolio sections.
+- The banner distinguishes the two failure modes with different text —
+  "not connected to the backend" (this tab's WebSocket is down; the
+  backend might be perfectly healthy) vs. "backend lost its IBKR
+  connection" (this tab is fine; TWS/Gateway isn't) — since they imply
+  different fixes (wait for this tab to reconnect, vs. check TWS itself).
+
+```bash
+cd frontend
+npm run build   # tsc -b && vite build — the type-check is the fast gate here
+```
+
+There's no dedicated frontend test runner in this project yet (see
+"What's not in this step"); this hardening pass was verified with a
+scripted mock backend broadcasting a simulated `{"type": "status",
+"state": "disconnected"}` message and a Playwright pass confirming the
+banner, dimming, and "STALE" tags all appear together and clear together.
 
 ### The chart component
 
@@ -673,5 +843,20 @@ same API, so `from ib_async import IB, Stock` is a drop-in replacement for
 - Browser push notifications need the tab open (even if unfocused/backgrounded)
   — reaching you with the tab or browser fully closed is what the optional
   Telegram integration is for, not the Notifications API.
+- The kill switch never closes open positions — only cancels working
+  orders and blocks new submission. Flattening a position after tripping
+  it is a manual step (see "Emergency kill switch" above and `RUNBOOK.md`).
+- Trading-safety state (armed/kill-switch/mismatch) is fetched once per
+  tab on load and updated locally by that tab's own actions — it isn't
+  pushed to other open tabs/browsers the way price/position data is. A
+  kill switch engaged from one tab won't visually update a second tab
+  until that tab is reloaded, even though the backend-side block applies
+  immediately everywhere. Fine for the single-user use case this is built
+  for; would need a WebSocket channel (like the ones prices already use)
+  to matter for more than one.
+- The IBKR pacing limiter is a client-side courtesy throttle tuned to
+  IBKR's documented/general guidance — not a hard guarantee against every
+  possible pacing violation (e.g. exceeding the account's own concurrent
+  market-data-line entitlement is a different limit entirely).
 
 These come in later steps, on top of this working data pipeline.
