@@ -1,14 +1,19 @@
 import { useState } from "react";
-import { addTicker, removeTicker } from "./api";
+import { addTicker, closeOptionPosition, removeTicker } from "./api";
 import { BarTable } from "./components/BarTable";
 import { ConnectionStatus } from "./components/ConnectionStatus";
 import { LiveChartPanel } from "./components/LiveChartPanel";
 import { NotificationSettingsPanel } from "./components/NotificationSettingsPanel";
+import { OptionsPanel } from "./components/OptionsPanel";
 import { SignalAlertTray } from "./components/SignalAlertTray";
 import { TickerControls } from "./components/TickerControls";
+import { TradingModeBanner } from "./components/TradingModeBanner";
 import { useBackendSocket } from "./useBackendSocket";
 import { useNotificationCenter } from "./useNotificationCenter";
+import { useOptionsChainStream } from "./useOptionsChainStream";
+import { usePositionsStream } from "./usePositionsStream";
 import { useSignalStream } from "./useSignalStream";
+import { useTradingSafety } from "./useTradingSafety";
 
 function App() {
   const { socketState, ibkrState, ibkrError, tickers, bars, barsBySymbol, tickerErrors } =
@@ -16,6 +21,9 @@ function App() {
   const { signals } = useSignalStream();
   const { settings, setSettings, toasts, dismissToast, permission, requestPermission } =
     useNotificationCenter(signals);
+  const tradingSafety = useTradingSafety();
+  const { quotesByKey } = useOptionsChainStream();
+  const { positions } = usePositionsStream();
 
   const [selectedSymbol, setSelectedSymbol] = useState<string | null>(null);
 
@@ -33,11 +41,27 @@ function App() {
         <ConnectionStatus socketState={socketState} ibkrState={ibkrState} ibkrError={ibkrError} />
       </header>
 
+      <TradingModeBanner
+        status={tradingSafety.status}
+        pending={tradingSafety.pending}
+        onSetArmed={tradingSafety.setArmed}
+      />
+      {tradingSafety.error && <p className="text-sm text-red-400">{tradingSafety.error}</p>}
+
       <LiveChartPanel
         tickers={tickers}
         barsBySymbol={barsBySymbol}
         selectedSymbol={selectedSymbol}
         onSelectSymbol={setSelectedSymbol}
+      />
+
+      <OptionsPanel
+        symbol={selectedSymbol}
+        quotesByKey={quotesByKey}
+        positions={positions}
+        onClosePosition={async (positionId) => {
+          await closeOptionPosition(positionId);
+        }}
       />
 
       <section className="flex flex-col gap-3 rounded-lg border border-slate-800 p-4">

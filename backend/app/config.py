@@ -47,6 +47,11 @@ class Settings(BaseSettings):
     telegram_enabled_rules: str = ""  # comma-separated rule names; blank = all
     telegram_cooldown_seconds: float = 120.0
 
+    # Options trading panel. ibkr_trading_mode above doubles as the options
+    # safety gate's fixed "paper"/"live" mode — see app/options/safety.py.
+    options_strikes_each_side: int = 5
+    options_chain_max_days_ahead: int = 7
+
     @property
     def telegram_enabled(self) -> bool:
         return bool(self.telegram_bot_token and self.telegram_chat_id)

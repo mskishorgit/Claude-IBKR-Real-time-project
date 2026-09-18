@@ -45,6 +45,15 @@ class MarketDataManager:
     def list_tickers(self) -> list[str]:
         return sorted(self._bars.keys())
 
+    def get_last_price(self, symbol: str) -> Optional[float]:
+        """Last known close for a tracked symbol, from its bar history —
+        used by the options chain to pick strikes near the money without
+        needing a separate stock market-data subscription."""
+        bars = self._bars.get(symbol.strip().upper())
+        if not bars:
+            return None
+        return bars[-1].close
+
     def subscribe(self) -> asyncio.Queue:
         queue: asyncio.Queue = asyncio.Queue(maxsize=1000)
         self._subscriber_queues.append(queue)

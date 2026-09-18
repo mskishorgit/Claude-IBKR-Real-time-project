@@ -3,10 +3,11 @@
 A full-stack project for building a live scalping dashboard on top of Interactive
 Brokers TWS/Gateway: IBKR → FastAPI backend → WebSocket → React frontend, with a
 live-updating candlestick chart, a rule-based signal engine that flags
-potential entries, and a notification layer (browser push, in-app alerts,
-sound, optional Telegram) so you don't have to stare at the tab to catch one.
-There is no order placement yet — this is detection and alerting on top of
-the live market-data pipeline.
+potential entries, a notification layer (browser push, in-app alerts, sound,
+optional Telegram), and an options trading panel that can place real 0DTE/weekly
+option orders through IBKR — paper by default, live gated behind an explicit,
+visible arm switch. **Read the "Options trading panel" section before touching
+that part of the UI against a live account.**
 
 ```
 scalp-dashboard/
@@ -103,6 +104,25 @@ flag and its key thresholds per rule) — covered in detail below.
   "direction": "long"|"short", "price": ..., "volume": ..., "timestamp": ...,
   "details": {...}}` whenever the signal engine flags a potential entry.
   Nothing else is sent on this channel.
+- `GET /api/trading-safety` / `POST /api/trading-safety/arm` `{"armed": bool}`
+  — read/set the options panel's live-trading arm switch. See "Options
+  trading panel" below.
+- `GET /api/options/expiries?symbol=` — near-term (0DTE/weekly) expiries for
+  a tracked underlying.
+- `POST /api/options/chain/subscribe` `{"symbol", "expiry"}` /
+  `POST /api/options/chain/unsubscribe` `{"symbol"}` — start/stop streaming
+  a chain's near-the-money strikes.
+- `POST /api/options/orders/preview` / `POST /api/options/orders/{id}/confirm`
+  / `DELETE /api/options/orders/preview/{id}` — the two-step order flow (see
+  below). A preview is single-use and short-lived.
+- `GET /api/options/positions` / `POST /api/options/positions/{id}/close` —
+  list open/closed positions; close is one-click (no preview/confirm step,
+  by design — see below).
+- `WS /ws/options` — live chain quotes (`option_quote` messages) for
+  whatever's currently subscribed.
+- `WS /ws/positions` — live P/L (`position_update`) and stop/target alerts
+  (`stop_target_alert`) for open positions; sends a `positions_snapshot` on
+  connect.
 
 ### The signal engine
 
@@ -227,6 +247,99 @@ notification settings below — the frontend's settings live in that
 browser's `localStorage`, which a backend process has no way to read, so the
 two are intentionally independent knobs.
 
+### Options trading panel
+
+**This places real orders through IBKR when armed against a live account.**
+`backend/app/options/` is a distinct package (safety.py, chain.py,
+positions.py, orders.py, stop_target.py) wired into `main.py` the same way
+as the signal engine — plain Python where it can be (stop/target math,
+P/L, the safety gate), ib_async only where it must be (chain lookups,
+market data, order placement).
+
+#### The paper/live safety model
+
+There are two independent things, both must line up before a *live* order
+can go through:
+
+1. **`IBKR_TRADING_MODE`** in `.env` — fixed for the backend process's
+   lifetime, same variable that already picks the connection port. This is
+   "which account is IBKR actually talking to."
+2. **The arm switch** — a runtime-only, in-memory flag (`live_armed`,
+   default `False`) toggled from the UI via `POST /api/trading-safety/arm`.
+   This is "has a human, right now, explicitly said yes to real orders."
+
+When `IBKR_TRADING_MODE=paper`, every order is inherently safe and the arm
+switch doesn't matter — the frontend shows no banner at all. When it's
+`live`, the UI shows an amber "connected to a LIVE account, orders blocked"
+banner until you arm it, at which point it becomes a bold red "LIVE TRADING
+ARMED" banner that stays up for as long as it's armed. Every order-placing
+call — preview, confirm, and one-click close — checks this gate; arming is
+never implicit and never assumed. **Test the whole flow against a paper
+account first.**
+
+#### The order flow
+
+1. Select a ticker (via the chart tabs, or by clicking a fired signal), pick
+   an expiry, click a bid/ask in the chain table to select that
+   strike/side, then fill in the order form (action, market/limit,
+   quantity, optional stop-loss/profit-target).
+2. **"Preview order"** calls `POST /api/options/orders/preview`, which
+   re-checks the safety gate, fetches a *fresh* quote, and returns a
+   short-lived (90s), single-use preview — nothing has been sent to IBKR
+   yet.
+3. A confirmation dialog shows exactly what that preview captured
+   (contract, action, quantity, the quote, and — in bold red if
+   applicable — that this is a LIVE order). **There is no way to submit
+   without this step.**
+4. **"Confirm & submit"** calls `POST /api/options/orders/{id}/confirm`,
+   which re-checks the safety gate again (state can change between preview
+   and confirm), pops the preview (single-use — a failure here always
+   means a fresh preview against a fresh quote next time, never a blind
+   resubmission), and only then calls `ib.placeOrder`. Every attempt and
+   every IBKR status/fill update is logged. **Nothing here retries
+   automatically, ever** — a failed submission is surfaced to you, not
+   silently reattempted.
+5. Once filled, the position appears with a live-updating unrealized P/L
+   (from the option's own live bid/ask, marked at the mid).
+6. **"Close position"** is deliberately **one click, no confirmation
+   dialog** (an explicit exception to the rule above, per spec, since
+   hesitating to exit a scalp costs money) — but it still runs through the
+   exact same safety gate as opening an order.
+
+#### Stop-loss / profit-target: alert-only (by design, for now)
+
+Set a stop and/or target (as a `$`-per-contract or `%`-of-entry-premium
+move) when you fill in the order form. Once the position is open, its live
+quote is checked against those levels on every tick; crossing one fires a
+**visual flag on that position's card and a `stop_target_alert` over
+`/ws/positions`** — it does **not** place an order and does **not**
+auto-close the position. Each level fires once (latched), not on every
+tick past it. Auto-submitting a bracket order to actually enforce these is
+an explicit stretch goal from the spec that isn't implemented — flagging
+first, reliably, was the priority.
+
+#### Options tests
+
+```bash
+cd backend
+source .venv/bin/activate
+python -m pytest tests/test_stop_target.py tests/test_trading_safety.py \
+  tests/test_option_quotes.py tests/test_option_position_pnl.py \
+  tests/test_position_manager.py tests/test_options_orders.py -v
+```
+
+Covers stop/target price math and level-hit checks for both directions and
+both `%`/`$` kinds explicitly (not via a clever shared formula — a
+sign/direction bug here is exactly the "expensive bug" this feature warns
+about), the arm/disarm gate in both trading modes, IBKR's price-sentinel
+vs. legitimate-negative-delta handling, P/L math long and short, stop/target
+alert latching (fires once, not every tick), and the full preview → confirm
+→ fill → position → close flow against a fake IBKR client built from real
+`ib_async` `Order`/`Trade` objects (so `trade.statusEvent`/`filledEvent`
+behave exactly like production) — including that a preview is rejected the
+second time it's used, and that both `create_preview` and `close_position`
+are blocked when live trading isn't armed.
+
 ### Common error states
 
 The backend is built to surface these clearly instead of failing silently:
@@ -275,6 +388,13 @@ Open the printed local URL (default `http://localhost:5173`). You should see:
   minutes), and pick which rules generate alerts at all.
 - A collapsible raw table of incoming 1-minute bars, for confirming the pipe
   itself still works independent of the chart.
+- An **options trading panel** for the selected ticker: near-term expiry
+  picker, a live chain table (click a bid/ask to select that strike/side),
+  an order form with a required confirmation dialog before anything is
+  sent, and an open-positions list with live P/L and one-click close. A
+  persistent banner appears whenever connected to a live account, escalating
+  once you arm it. **Read the backend's "Options trading panel" section
+  above before using this against a live account.**
 
 ### The chart component
 
@@ -327,6 +447,8 @@ toast's ticker calls the same `onSelectSymbol` the chart's ticker tabs use.
 | `VITE_BACKEND_HTTP_URL` | `http://localhost:8000` | Base URL for REST calls |
 | `VITE_BACKEND_WS_URL` | `ws://localhost:8000/ws/bars` | Raw bar WebSocket URL |
 | `VITE_BACKEND_SIGNALS_WS_URL` | `ws://localhost:8000/ws/signals` | Signal alert WebSocket URL |
+| `VITE_BACKEND_OPTIONS_WS_URL` | `ws://localhost:8000/ws/options` | Options chain quote WebSocket URL |
+| `VITE_BACKEND_POSITIONS_WS_URL` | `ws://localhost:8000/ws/positions` | Option positions WebSocket URL |
 
 ## Notes on the IBKR library choice
 
@@ -339,11 +461,16 @@ same API, so `from ib_async import IB, Stock` is a drop-in replacement for
 
 - No watchlist grid of multiple charts at once (the chart component is built
   to support this next, but the UI only shows one at a time so far).
-- No order placement — the signal engine only detects and alerts.
-- No persistence of bar, signal, or notification history (only what's held
-  in memory per backend process, and in each browser's `localStorage`/tab
-  memory). The relative-volume baseline and Telegram's cooldown both reset
-  on backend restart for the same reason; the toast tray resets on page reload.
+- No auto-submitted bracket order for stop-loss/profit-target — crossing a
+  level only flags/alerts (see "Options trading panel" above); this is an
+  explicit, unimplemented stretch goal per the spec, not an oversight.
+- No multi-leg option strategies (spreads, straddles, etc.) — single-leg
+  calls/puts only.
+- No persistence of bar, signal, notification, order, or position history
+  (only what's held in memory per backend process, and in each browser's
+  `localStorage`/tab memory). The relative-volume baseline, Telegram's
+  cooldown, and all open/closed positions reset on backend restart for the
+  same reason; the signal toast tray resets on page reload.
 - Browser push notifications need the tab open (even if unfocused/backgrounded)
   — reaching you with the tab or browser fully closed is what the optional
   Telegram integration is for, not the Notifications API.

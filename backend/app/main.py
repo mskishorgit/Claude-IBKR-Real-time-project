@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from contextlib import asynccontextmanager
+from typing import Literal, Optional
 
 from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
@@ -12,6 +13,15 @@ from .config import get_settings
 from .ibkr.connection import ConnectionState, IBKRConnectionManager
 from .ibkr.market_data import MarketDataManager, TickerAlreadyTracked
 from .notifications.telegram import TelegramNotifier
+from .options.chain import OptionsChainError, OptionsChainService
+from .options.models import OptionContractKey, OptionPosition, StopTargetConfig
+from .options.orders import (
+    OptionsOrderService,
+    OrderValidationError,
+    PreviewNotFoundError,
+)
+from .options.positions import PositionManager
+from .options.safety import LiveTradingNotArmedError, TradingSafety
 from .signals.factory import build_default_engine
 from .signals.models import Bar, Signal
 
@@ -106,6 +116,63 @@ def _dispatch_telegram(signal: Signal) -> None:
 market_data_manager.add_bar_closed_listener(_on_bar_closed)
 market_data_manager.add_ticker_removed_listener(signal_engine.reset_symbol)
 
+# --- Options trading panel ---------------------------------------------
+# trading_safety.trading_mode is fixed to whatever IBKR_TRADING_MODE the
+# backend connected with; live_armed is the runtime, human-toggled gate
+# that must also be true before a *live* order can go through. See
+# app/options/safety.py for exactly what this does and doesn't protect.
+trading_safety = TradingSafety(trading_mode=settings.ibkr_trading_mode)
+options_chain_service = OptionsChainService(connection_manager.ib, market_data_manager.get_last_price)
+position_manager = PositionManager(connection_manager.ib)
+options_order_service = OptionsOrderService(
+    connection_manager.ib, options_chain_service, position_manager, trading_safety
+)
+
+_option_chain_subscribers: list[asyncio.Queue] = []
+_position_subscribers: list[asyncio.Queue] = []
+
+
+def _broadcast_option_chain(payload: dict) -> None:
+    for queue in list(_option_chain_subscribers):
+        try:
+            queue.put_nowait(payload)
+        except asyncio.QueueFull:
+            logger.warning("Dropping option chain update for slow WebSocket subscriber")
+
+
+def _broadcast_position(payload: dict) -> None:
+    for queue in list(_position_subscribers):
+        try:
+            queue.put_nowait(payload)
+        except asyncio.QueueFull:
+            logger.warning("Dropping position update for slow WebSocket subscriber")
+
+
+def _on_position_update(position: OptionPosition) -> None:
+    _broadcast_position({"type": "position_update", **position.to_dict()})
+
+
+def _on_stop_target_alert(position: OptionPosition, level: str) -> None:
+    logger.info("Stop/target alert: position %s hit its %s level", position.id, level)
+    _broadcast_position({"type": "stop_target_alert", "level": level, **position.to_dict()})
+
+
+position_manager.add_position_listener(_on_position_update)
+position_manager.add_alert_listener(_on_stop_target_alert)
+
+
+def _on_pending_tickers(tickers) -> None:
+    for ticker in tickers:
+        quote = options_chain_service.build_quote_from_ticker(ticker)
+        if quote is not None:
+            _broadcast_option_chain({"type": "option_quote", **quote.to_dict()})
+        # A ticker can matter to both a chain view and an open position at
+        # once (nothing stops handle_ticker from being a no-op when it isn't).
+        position_manager.handle_ticker(ticker)
+
+
+connection_manager.ib.pendingTickersEvent += _on_pending_tickers
+
 
 def _broadcast_status(state: ConnectionState, error: str | None) -> None:
     payload = {"type": "status", "state": state.value, "error": error}
@@ -194,6 +261,165 @@ async def remove_ticker(symbol: str):
     return {"tickers": market_data_manager.list_tickers()}
 
 
+# --- Options trading panel ----------------------------------------------
+
+
+class ArmLiveTradingRequest(BaseModel):
+    armed: bool
+
+
+@app.get("/api/trading-safety")
+async def get_trading_safety():
+    return trading_safety.status()
+
+
+@app.post("/api/trading-safety/arm")
+async def set_trading_safety_armed(request: ArmLiveTradingRequest):
+    if request.armed and trading_safety.trading_mode != "live":
+        raise HTTPException(
+            status_code=400,
+            detail="Nothing to arm — this backend is connected in paper mode",
+        )
+    trading_safety.set_armed(request.armed)
+    if trading_safety.trading_mode == "live":
+        logger.warning("LIVE TRADING armed=%s", request.armed)
+    return trading_safety.status()
+
+
+class StopTargetRequest(BaseModel):
+    kind: Literal["pct", "abs"]
+    value: float
+
+    @field_validator("value")
+    @classmethod
+    def value_must_be_positive(cls, value: float) -> float:
+        if value <= 0:
+            raise ValueError("stop/target value must be positive")
+        return value
+
+    def to_config(self) -> StopTargetConfig:
+        return StopTargetConfig(kind=self.kind, value=self.value)
+
+
+class ChainSubscribeRequest(BaseModel):
+    symbol: str
+    expiry: str
+
+
+class ChainUnsubscribeRequest(BaseModel):
+    symbol: str
+
+
+class OrderPreviewRequest(BaseModel):
+    symbol: str
+    expiry: str
+    strike: float
+    right: Literal["C", "P"]
+    action: Literal["BUY", "SELL"]
+    order_type: Literal["MKT", "LMT"]
+    quantity: int
+    limit_price: Optional[float] = None
+    stop_loss: Optional[StopTargetRequest] = None
+    profit_target: Optional[StopTargetRequest] = None
+
+    def to_key(self) -> OptionContractKey:
+        return OptionContractKey(
+            symbol=self.symbol.strip().upper(), expiry=self.expiry, strike=self.strike, right=self.right
+        )
+
+
+def _require_ibkr_connected() -> None:
+    if not connection_manager.ib.isConnected():
+        raise HTTPException(status_code=503, detail="Not connected to IBKR TWS/Gateway")
+
+
+@app.get("/api/options/expiries")
+async def get_option_expiries(symbol: str):
+    _require_ibkr_connected()
+    try:
+        expiries = await options_chain_service.list_near_term_expiries(
+            symbol.strip().upper(), settings.options_chain_max_days_ahead
+        )
+    except OptionsChainError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return {"symbol": symbol.strip().upper(), "expiries": expiries}
+
+
+@app.post("/api/options/chain/subscribe")
+async def subscribe_option_chain(request: ChainSubscribeRequest):
+    _require_ibkr_connected()
+    try:
+        quotes = await options_chain_service.subscribe(
+            request.symbol, request.expiry, settings.options_strikes_each_side
+        )
+    except OptionsChainError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return {"quotes": [q.to_dict() for q in quotes]}
+
+
+@app.post("/api/options/chain/unsubscribe")
+async def unsubscribe_option_chain(request: ChainUnsubscribeRequest):
+    await options_chain_service.unsubscribe(request.symbol)
+    return {"status": "ok"}
+
+
+@app.post("/api/options/orders/preview", status_code=201)
+async def create_order_preview(request: OrderPreviewRequest):
+    _require_ibkr_connected()
+    try:
+        preview = await options_order_service.create_preview(
+            request.to_key(),
+            request.action,
+            request.order_type,
+            request.quantity,
+            request.limit_price,
+            request.stop_loss.to_config() if request.stop_loss else None,
+            request.profit_target.to_config() if request.profit_target else None,
+        )
+    except LiveTradingNotArmedError as exc:
+        raise HTTPException(status_code=403, detail=str(exc)) from exc
+    except OrderValidationError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return preview.to_dict()
+
+
+@app.post("/api/options/orders/{preview_id}/confirm")
+async def confirm_order(preview_id: str):
+    _require_ibkr_connected()
+    try:
+        trade = await options_order_service.confirm_order(preview_id)
+    except PreviewNotFoundError as exc:
+        raise HTTPException(status_code=410, detail=str(exc)) from exc
+    except LiveTradingNotArmedError as exc:
+        raise HTTPException(status_code=403, detail=str(exc)) from exc
+    return {"order_id": trade.order.orderId, "status": trade.orderStatus.status}
+
+
+@app.delete("/api/options/orders/preview/{preview_id}")
+async def discard_order_preview(preview_id: str):
+    options_order_service.discard_preview(preview_id)
+    return {"status": "ok"}
+
+
+@app.get("/api/options/positions")
+async def list_option_positions():
+    return {"positions": [p.to_dict() for p in position_manager.list_positions()]}
+
+
+@app.post("/api/options/positions/{position_id}/close")
+async def close_option_position(position_id: str):
+    """One-click by design (per spec) — no confirmation step, unlike
+    opening an order — but still gated by the same trading-safety check."""
+    _require_ibkr_connected()
+    try:
+        trade = await options_order_service.close_position(position_id)
+    except LiveTradingNotArmedError as exc:
+        raise HTTPException(status_code=403, detail=str(exc)) from exc
+    except OrderValidationError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return {"order_id": trade.order.orderId, "status": trade.orderStatus.status}
+
+
 @app.websocket("/ws/bars")
 async def stream_bars(websocket: WebSocket):
     await websocket.accept()
@@ -261,3 +487,64 @@ async def stream_signals(websocket: WebSocket):
         pump_task.cancel()
         if signal_queue in _signal_subscribers:
             _signal_subscribers.remove(signal_queue)
+
+
+@app.websocket("/ws/options")
+async def stream_option_chain(websocket: WebSocket):
+    """Live quotes (bid/ask/delta/IV) for whatever option chain(s) are
+    currently subscribed via POST /api/options/chain/subscribe. Separate
+    from /ws/positions so a client can watch one without the other."""
+    await websocket.accept()
+
+    queue: asyncio.Queue = asyncio.Queue(maxsize=500)
+    _option_chain_subscribers.append(queue)
+
+    async def pump() -> None:
+        while True:
+            message = await queue.get()
+            await websocket.send_json(message)
+
+    pump_task = asyncio.create_task(pump())
+    try:
+        while True:
+            await websocket.receive_text()
+    except WebSocketDisconnect:
+        pass
+    finally:
+        pump_task.cancel()
+        if queue in _option_chain_subscribers:
+            _option_chain_subscribers.remove(queue)
+
+
+@app.websocket("/ws/positions")
+async def stream_positions(websocket: WebSocket):
+    """Live P/L for open option positions, and stop/target alerts. Stays
+    relevant regardless of what's being browsed in the options chain, so
+    it's deliberately a separate channel from /ws/options."""
+    await websocket.accept()
+
+    queue: asyncio.Queue = asyncio.Queue(maxsize=500)
+    _position_subscribers.append(queue)
+
+    await websocket.send_json(
+        {
+            "type": "positions_snapshot",
+            "positions": [p.to_dict() for p in position_manager.list_positions()],
+        }
+    )
+
+    async def pump() -> None:
+        while True:
+            message = await queue.get()
+            await websocket.send_json(message)
+
+    pump_task = asyncio.create_task(pump())
+    try:
+        while True:
+            await websocket.receive_text()
+    except WebSocketDisconnect:
+        pass
+    finally:
+        pump_task.cancel()
+        if queue in _position_subscribers:
+            _position_subscribers.remove(queue)
