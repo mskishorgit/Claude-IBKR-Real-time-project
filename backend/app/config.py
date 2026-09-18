@@ -39,6 +39,22 @@ class Settings(BaseSettings):
     signals_relative_volume_min_ratio: float = 1.0
     signals_relative_volume_min_sessions: int = 1
 
+    # Optional Telegram notifications. Disabled unless both a bot token and
+    # chat id are set — nothing is hardcoded. See README for setup via
+    # @BotFather.
+    telegram_bot_token: str = ""
+    telegram_chat_id: str = ""
+    telegram_enabled_rules: str = ""  # comma-separated rule names; blank = all
+    telegram_cooldown_seconds: float = 120.0
+
+    @property
+    def telegram_enabled(self) -> bool:
+        return bool(self.telegram_bot_token and self.telegram_chat_id)
+
+    @property
+    def telegram_enabled_rules_list(self) -> list[str]:
+        return [r.strip() for r in self.telegram_enabled_rules.split(",") if r.strip()]
+
     @property
     def ibkr_port(self) -> int:
         return self.ibkr_paper_port if self.ibkr_trading_mode.lower() == "paper" else self.ibkr_live_port

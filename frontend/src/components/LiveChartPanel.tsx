@@ -6,23 +6,26 @@ import type { ChartOverlays } from "./CandlestickChart";
 interface Props {
   tickers: string[];
   barsBySymbol: BarsBySymbol;
+  /** The caller (App) owns selection so a signal alert's click-through can
+   * also switch this chart to that ticker, not just the tabs below. */
+  selectedSymbol: string | null;
+  onSelectSymbol: (symbol: string) => void;
 }
 
 const EMPTY_BARS: BarsBySymbol[string] = [];
 
-export function LiveChartPanel({ tickers, barsBySymbol }: Props) {
-  const [requestedSymbol, setRequestedSymbol] = useState<string | null>(null);
+export function LiveChartPanel({ tickers, barsBySymbol, selectedSymbol, onSelectSymbol }: Props) {
   const [overlays, setOverlays] = useState<Required<ChartOverlays>>({
     vwap: true,
     ema9: true,
     ema20: true,
   });
 
-  // Fall back to the first tracked ticker whenever the user's chosen symbol
-  // isn't (or isn't yet) in the tracked list, without touching the WebSocket
-  // connection that's feeding barsBySymbol.
+  // Fall back to the first tracked ticker whenever the caller's chosen
+  // symbol isn't (or isn't yet) in the tracked list, without touching the
+  // WebSocket connection that's feeding barsBySymbol.
   const selected =
-    requestedSymbol && tickers.includes(requestedSymbol) ? requestedSymbol : (tickers[0] ?? null);
+    selectedSymbol && tickers.includes(selectedSymbol) ? selectedSymbol : (tickers[0] ?? null);
 
   return (
     <div className="flex flex-col gap-3 rounded-lg border border-slate-800 p-4">
@@ -35,7 +38,7 @@ export function LiveChartPanel({ tickers, barsBySymbol }: Props) {
               type="button"
               role="tab"
               aria-selected={symbol === selected}
-              onClick={() => setRequestedSymbol(symbol)}
+              onClick={() => onSelectSymbol(symbol)}
               className={`rounded px-3 py-1.5 font-mono text-sm transition-colors ${
                 symbol === selected
                   ? "bg-emerald-600 text-white"

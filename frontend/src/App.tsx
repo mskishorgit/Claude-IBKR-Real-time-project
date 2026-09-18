@@ -1,16 +1,28 @@
+import { useState } from "react";
 import { addTicker, removeTicker } from "./api";
 import { BarTable } from "./components/BarTable";
 import { ConnectionStatus } from "./components/ConnectionStatus";
 import { LiveChartPanel } from "./components/LiveChartPanel";
+import { NotificationSettingsPanel } from "./components/NotificationSettingsPanel";
+import { SignalAlertTray } from "./components/SignalAlertTray";
 import { TickerControls } from "./components/TickerControls";
 import { useBackendSocket } from "./useBackendSocket";
+import { useNotificationCenter } from "./useNotificationCenter";
+import { useSignalStream } from "./useSignalStream";
 
 function App() {
   const { socketState, ibkrState, ibkrError, tickers, bars, barsBySymbol, tickerErrors } =
     useBackendSocket();
+  const { signals } = useSignalStream();
+  const { settings, setSettings, toasts, dismissToast, permission, requestPermission } =
+    useNotificationCenter(signals);
+
+  const [selectedSymbol, setSelectedSymbol] = useState<string | null>(null);
 
   return (
     <div className="mx-auto flex min-h-svh max-w-5xl flex-col gap-6 px-4 py-8">
+      <SignalAlertTray toasts={toasts} onDismiss={dismissToast} onSelectSymbol={setSelectedSymbol} />
+
       <header className="flex flex-col gap-4 sm:flex-row sm:items-start sm:justify-between">
         <div>
           <h1 className="text-2xl font-semibold text-slate-50">Scalp Dashboard</h1>
@@ -21,7 +33,12 @@ function App() {
         <ConnectionStatus socketState={socketState} ibkrState={ibkrState} ibkrError={ibkrError} />
       </header>
 
-      <LiveChartPanel tickers={tickers} barsBySymbol={barsBySymbol} />
+      <LiveChartPanel
+        tickers={tickers}
+        barsBySymbol={barsBySymbol}
+        selectedSymbol={selectedSymbol}
+        onSelectSymbol={setSelectedSymbol}
+      />
 
       <section className="flex flex-col gap-3 rounded-lg border border-slate-800 p-4">
         <h2 className="text-sm font-medium text-slate-300">Tracked tickers</h2>
@@ -33,6 +50,16 @@ function App() {
           onRemove={async (symbol) => {
             await removeTicker(symbol);
           }}
+        />
+      </section>
+
+      <section className="flex flex-col gap-3 rounded-lg border border-slate-800 p-4">
+        <h2 className="text-sm font-medium text-slate-300">Signal alerts</h2>
+        <NotificationSettingsPanel
+          settings={settings}
+          onChange={setSettings}
+          permission={permission}
+          onRequestPermission={requestPermission}
         />
       </section>
 

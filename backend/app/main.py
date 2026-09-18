@@ -11,6 +11,7 @@ from pydantic import BaseModel, field_validator
 from .config import get_settings
 from .ibkr.connection import ConnectionState, IBKRConnectionManager
 from .ibkr.market_data import MarketDataManager, TickerAlreadyTracked
+from .notifications.telegram import TelegramNotifier
 from .signals.factory import build_default_engine
 from .signals.models import Bar, Signal
 
@@ -47,6 +48,21 @@ signal_engine = build_default_engine(
     relative_volume_min_sessions=settings.signals_relative_volume_min_sessions,
 )
 
+telegram_notifier: TelegramNotifier | None = None
+if settings.telegram_enabled:
+    telegram_notifier = TelegramNotifier(
+        bot_token=settings.telegram_bot_token,
+        chat_id=settings.telegram_chat_id,
+        enabled_rules=set(settings.telegram_enabled_rules_list) or None,
+        cooldown_seconds=settings.telegram_cooldown_seconds,
+    )
+    logger.info("Telegram notifications enabled")
+else:
+    logger.info(
+        "Telegram notifications disabled (set TELEGRAM_BOT_TOKEN and "
+        "TELEGRAM_CHAT_ID in .env to enable)"
+    )
+
 _status_subscribers: list[asyncio.Queue] = []
 _signal_subscribers: list[asyncio.Queue] = []
 
@@ -60,6 +76,7 @@ def _on_bar_closed(bar: Bar) -> None:
     for signal in signals:
         logger.info("Signal fired: %s %s %s @ %s", signal.ticker, signal.rule, signal.direction, signal.price)
         _broadcast_signal(signal)
+        _dispatch_telegram(signal)
 
 
 def _broadcast_signal(signal: Signal) -> None:
@@ -69,6 +86,21 @@ def _broadcast_signal(signal: Signal) -> None:
             queue.put_nowait(payload)
         except asyncio.QueueFull:
             logger.warning("Dropping signal for slow WebSocket subscriber")
+
+
+def _dispatch_telegram(signal: Signal) -> None:
+    if telegram_notifier is None:
+        return
+    task = asyncio.create_task(telegram_notifier.notify(signal))
+
+    def _log_if_failed(finished: asyncio.Task) -> None:
+        if finished.cancelled():
+            return
+        exc = finished.exception()
+        if exc is not None:
+            logger.error("Telegram notify task raised", exc_info=exc)
+
+    task.add_done_callback(_log_if_failed)
 
 
 market_data_manager.add_bar_closed_listener(_on_bar_closed)
@@ -107,6 +139,8 @@ async def lifespan(app: FastAPI):
         yield
     finally:
         await connection_manager.disconnect()
+        if telegram_notifier is not None:
+            await telegram_notifier.aclose()
 
 
 app = FastAPI(title="Scalp Dashboard Backend", lifespan=lifespan)

@@ -2,9 +2,11 @@
 
 A full-stack project for building a live scalping dashboard on top of Interactive
 Brokers TWS/Gateway: IBKR → FastAPI backend → WebSocket → React frontend, with a
-live-updating candlestick chart and a rule-based signal engine that flags
-potential entries. There is no order placement yet — this is detection and
-alerting on top of the live market-data pipeline.
+live-updating candlestick chart, a rule-based signal engine that flags
+potential entries, and a notification layer (browser push, in-app alerts,
+sound, optional Telegram) so you don't have to stare at the tab to catch one.
+There is no order placement yet — this is detection and alerting on top of
+the live market-data pipeline.
 
 ```
 scalp-dashboard/
@@ -186,8 +188,44 @@ python -m pytest tests/ -v
 Covers each rule firing and *not* firing under a hand-built deterministic
 bar sequence, the relative-volume filter suppressing a signal (with an
 identical unfiltered run proving the filter — not something else — was
-responsible), the CSV loader, and the bar-closed vs. raw-bar dispatch logic
-in `MarketDataManager`.
+responsible), the CSV loader, the bar-closed vs. raw-bar dispatch logic in
+`MarketDataManager`, and the Telegram notifier's rule filter/cooldown/payload
+(via `httpx.MockTransport`, no real network calls).
+
+### Optional: Telegram notifications
+
+`backend/app/notifications/telegram.py` posts a message to a Telegram chat
+for every signal that isn't filtered by rule or still inside its own
+cooldown — independent of anything happening in the browser, so this is what
+reaches you if the dashboard's tab (or the browser itself) is closed.
+**Disabled unless you set it up** — nothing is hardcoded, and by default
+`TELEGRAM_BOT_TOKEN`/`TELEGRAM_CHAT_ID` are blank in `.env.example`:
+
+1. Message **@BotFather** on Telegram, send `/newbot`, follow the prompts —
+   you get a bot token back.
+2. Send your new bot any message (e.g. "hi"), then open
+   `https://api.telegram.org/bot<your-token>/getUpdates` in a browser and
+   read your chat id out of the JSON (`"chat": {"id": ...}`).
+3. Put both in `backend/.env`:
+
+   ```bash
+   TELEGRAM_BOT_TOKEN=123456:your-token-here
+   TELEGRAM_CHAT_ID=123456789
+   ```
+4. Restart the backend. Logs will say `Telegram notifications enabled` on
+   startup if both values are present.
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `TELEGRAM_BOT_TOKEN` | *(blank = disabled)* | Bot token from @BotFather |
+| `TELEGRAM_CHAT_ID` | *(blank = disabled)* | Chat id to send messages to |
+| `TELEGRAM_ENABLED_RULES` | *(blank = all rules)* | Comma-separated rule names to notify on via Telegram |
+| `TELEGRAM_COOLDOWN_SECONDS` | `120` | Minimum seconds between two Telegram messages for the same ticker+rule |
+
+This has its own rule filter and cooldown, separate from the frontend's
+notification settings below — the frontend's settings live in that
+browser's `localStorage`, which a backend process has no way to read, so the
+two are intentionally independent knobs.
 
 ### Common error states
 
@@ -230,6 +268,11 @@ Open the printed local URL (default `http://localhost:5173`). You should see:
 - VWAP, EMA(9), and EMA(20) overlays, each independently toggleable.
 - A dashed live price line on the chart tracking the latest close.
 - A ticker control box to add/remove symbols at runtime.
+- A **signal alerts tray** (top-right) showing recent fired signals as
+  dismissible cards — click one to jump the chart to that ticker.
+- A **Signal alerts** settings section: enable browser push notifications,
+  mute/test the audible alert, set the per-ticker/rule cooldown (default 2
+  minutes), and pick which rules generate alerts at all.
 - A collapsible raw table of incoming 1-minute bars, for confirming the pipe
   itself still works independent of the chart.
 
@@ -247,12 +290,43 @@ bars already held in the browser (`useBackendSocket`'s `barsBySymbol`), not
 by the backend — VWAP resets at each UTC calendar day boundary as an
 approximation of a trading session.
 
+### The notification layer
+
+`frontend/src/useNotificationCenter.ts` turns the raw `/ws/signals` stream
+(`useSignalStream.ts`, a separate WebSocket connection from `/ws/bars`) into
+toasts, browser push notifications, and sound — each signal is processed
+exactly once, gated by two things from **Signal alerts** settings
+(persisted in `localStorage`, per-browser, nothing sent to the backend):
+
+- **Per-rule enable/disable** — a signal for a disabled rule produces no
+  toast, no push notification, and no sound at all.
+- **A cooldown window** (default 2 minutes, configurable) keyed by
+  `ticker:rule` — a second signal for the same ticker and rule within the
+  window is silently dropped, so a choppy market can't spam you.
+
+Browser push notifications (`Notification` API) fire even when the tab isn't
+focused, as long as the browser has the tab open at all — click "Enable
+browser notifications" once (browsers require a user gesture; it can't
+prompt itself on load). If the tab or browser is fully closed, only the
+optional Telegram integration above still reaches you.
+
+Audible alerts (`frontend/src/alertSound.ts`) are synthesized with the Web
+Audio API — an ascending two-note chime for long signals, descending for
+short — so there are no sound assets to ship or host. A mute toggle and a
+"Test sound" button (which also satisfies the browser's autoplay-unlock
+requirement) are in the settings panel.
+
+The toast tray (`SignalAlertTray.tsx`) keeps up to the 50 most recent
+alerts, newest first, until you dismiss them individually; clicking a
+toast's ticker calls the same `onSelectSymbol` the chart's ticker tabs use.
+
 ### Frontend environment variables (`frontend/.env`)
 
 | Variable | Default | Meaning |
 |---|---|---|
 | `VITE_BACKEND_HTTP_URL` | `http://localhost:8000` | Base URL for REST calls |
-| `VITE_BACKEND_WS_URL` | `ws://localhost:8000/ws/bars` | WebSocket URL |
+| `VITE_BACKEND_WS_URL` | `ws://localhost:8000/ws/bars` | Raw bar WebSocket URL |
+| `VITE_BACKEND_SIGNALS_WS_URL` | `ws://localhost:8000/ws/signals` | Signal alert WebSocket URL |
 
 ## Notes on the IBKR library choice
 
@@ -265,13 +339,13 @@ same API, so `from ib_async import IB, Stock` is a drop-in replacement for
 
 - No watchlist grid of multiple charts at once (the chart component is built
   to support this next, but the UI only shows one at a time so far).
-- No frontend UI for the signal feed yet (`/ws/signals` exists and can be
-  subscribed to directly; there's no panel/toast rendering it in the React
-  app so far).
 - No order placement — the signal engine only detects and alerts.
-- No persistence of bar or signal history (only what's held in memory per
-  browser tab and per backend process since they started, plus whatever
-  IBKR returns for the initial lookback window). The relative-volume
-  baseline resets on backend restart for the same reason.
+- No persistence of bar, signal, or notification history (only what's held
+  in memory per backend process, and in each browser's `localStorage`/tab
+  memory). The relative-volume baseline and Telegram's cooldown both reset
+  on backend restart for the same reason; the toast tray resets on page reload.
+- Browser push notifications need the tab open (even if unfocused/backgrounded)
+  — reaching you with the tab or browser fully closed is what the optional
+  Telegram integration is for, not the Notifications API.
 
 These come in later steps, on top of this working data pipeline.

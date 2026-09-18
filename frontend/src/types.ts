@@ -29,4 +29,17 @@ export interface TickerErrorMessage {
   message: string;
 }
 
+export type SignalDirection = "long" | "short";
+
+export interface SignalMessage {
+  type: "signal";
+  ticker: string;
+  rule: string;
+  direction: SignalDirection;
+  price: number;
+  volume: number;
+  timestamp: string;
+  details: Record<string, unknown>;
+}
+
 export type ServerMessage = StatusMessage | TickersMessage | BarMessage | TickerErrorMessage;
