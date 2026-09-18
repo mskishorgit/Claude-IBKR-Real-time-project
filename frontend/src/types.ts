@@ -198,3 +198,58 @@ export type PortfolioServerMessage =
   | AccountOptionPositionUpdateMessage
   | AccountSummaryMessage
   | PortfolioSnapshotMessage;
+
+// --- Trading journal ---------------------------------------------------
+
+export type JournalTradeSource = "execution" | "options_panel";
+
+export interface JournalTradeData {
+  id: string;
+  symbol: string;
+  sec_type: string;
+  direction: SignalDirection;
+  quantity: number;
+  entry_time: string;
+  entry_price: number;
+  exit_time: string;
+  exit_price: number;
+  realized_pnl: number;
+  source: JournalTradeSource;
+  expiry: string | null;
+  strike: number | null;
+  right: OptionRight | null;
+  signal_rule: string | null;
+  signal_timestamp: string | null;
+}
+
+export interface DayPnlData {
+  date: string;
+  realized_pnl: number;
+  trade_count: number;
+}
+
+export interface WeeklyPnlData {
+  week_start: string;
+  realized_pnl: number;
+}
+
+export interface MonthStatsData {
+  year: number;
+  month: number;
+  total_pnl: number;
+  trade_count: number;
+  win_count: number;
+  loss_count: number;
+  win_rate: number | null;
+  avg_win: number | null;
+  avg_loss: number | null;
+  largest_win: number | null;
+  largest_loss: number | null;
+  weekly_pnl: WeeklyPnlData[];
+}
+
+export interface TradeRecordedMessage extends JournalTradeData {
+  type: "trade_recorded";
+}
+
+export type JournalServerMessage = TradeRecordedMessage;

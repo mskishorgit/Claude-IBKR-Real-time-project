@@ -2,6 +2,9 @@ import type {
   AccountOptionPositionData,
   AccountPositionData,
   AccountSummaryData,
+  DayPnlData,
+  JournalTradeData,
+  MonthStatsData,
   OptionPositionData,
   OptionQuoteData,
   OptionRight,
@@ -169,4 +172,22 @@ export async function getPortfolioPositions(): Promise<{
 
 export async function getPortfolioSummary(): Promise<AccountSummaryData> {
   return requestJson("/api/portfolio/summary", {}, "Failed to load account summary");
+}
+
+// --- Trading journal --------------------------------------------------------
+
+export async function getJournalCalendar(year: number, month: number): Promise<{ days: DayPnlData[] }> {
+  return requestJson(`/api/journal/calendar?year=${year}&month=${month}`, {}, "Failed to load journal calendar");
+}
+
+export async function getJournalDay(day: string): Promise<{ trades: JournalTradeData[] }> {
+  return requestJson(`/api/journal/day?day=${encodeURIComponent(day)}`, {}, "Failed to load journal day");
+}
+
+export async function getJournalStats(year: number, month: number): Promise<MonthStatsData> {
+  return requestJson(`/api/journal/stats?year=${year}&month=${month}`, {}, "Failed to load journal stats");
+}
+
+export async function triggerJournalSync(): Promise<{ status: string }> {
+  return requestJson("/api/journal/sync", { method: "POST" }, "Failed to sync journal with IBKR");
 }

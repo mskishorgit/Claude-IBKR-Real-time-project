@@ -6,9 +6,12 @@ live-updating candlestick chart, a rule-based signal engine that flags
 potential entries, a notification layer (browser push, in-app alerts, sound,
 optional Telegram), an options trading panel that can place real 0DTE/weekly
 option orders through IBKR — paper by default, live gated behind an explicit,
-visible arm switch — and a live watchlist/portfolio view pulling the account's
-actual positions and P/L straight from IBKR. **Read the "Options trading panel"
-section before touching that part of the UI against a live account.**
+visible arm switch — a live watchlist/portfolio view pulling the account's
+actual positions and P/L straight from IBKR, and a trading journal with a
+daily P/L calendar backed by a local SQLite database, reconciled
+periodically against IBKR's own execution history. **Read the "Options
+trading panel" section before touching that part of the UI against a live
+account.**
 
 ```
 scalp-dashboard/
@@ -82,6 +85,8 @@ silent failure.
 | `IBKR_HEARTBEAT_INTERVAL_SECONDS` | `10` | How often to ping TWS/Gateway to detect a stale connection |
 | `DEFAULT_TICKERS` | `AAPL,MSFT,SPY` | Tickers subscribed on startup |
 | `CORS_ORIGINS` | `http://localhost:5173` | Allowed frontend origin(s) |
+| `JOURNAL_DB_PATH` | `scalp_journal.db` | SQLite file for the trading journal (relative to `backend/`) |
+| `JOURNAL_SYNC_INTERVAL_SECONDS` | `300` | How often to reconcile against IBKR's execution history |
 
 See `.env.example` for the signal engine's `SIGNALS_*` variables (one enabled
 flag and its key thresholds per rule) — covered in detail below.
@@ -134,6 +139,20 @@ flag and its key thresholds per rule) — covered in detail below.
 - `WS /ws/portfolio` — sends a `portfolio_snapshot` (both position lists +
   the summary) on connect, then `position_update` / `option_position_update`
   / `account_summary` messages as IBKR reports changes.
+- `GET /api/journal/calendar?year=&month=` — that month's realized P/L and
+  trade count per day that had at least one closed trade.
+- `GET /api/journal/day?day=YYYY-MM-DD` — every closed round-trip trade for
+  one day (ticker, entry/exit time+price, contract details if it was an
+  option, P/L, and the signal rule that triggered the entry, if any).
+- `GET /api/journal/stats?year=&month=` — win rate, average win/loss,
+  largest win/loss, and a per-ISO-week P/L breakdown for that month.
+- `POST /api/journal/sync` — trigger an immediate `reqExecutions`
+  reconciliation on top of the periodic background sync (returns `503` if
+  not currently connected to IBKR).
+- `WS /ws/journal` — sends a `trade_recorded` message whenever a new
+  round-trip trade lands in the journal DB; carries no data of its own
+  beyond that nudge, since REST stays the source of truth for the
+  calendar/day/stats data itself.
 
 ### The signal engine
 
@@ -417,6 +436,79 @@ print. Documented here rather than silently assumed — see the chart's VWAP
 session-reset caveat for the same kind of tradeoff made elsewhere in this
 project.
 
+### Trading journal
+
+`backend/app/journal/` persists closed round-trip trades and a log of fired
+signals to a local SQLite database (`backend/scalp_journal.db` by default,
+`JOURNAL_DB_PATH`), so the calendar/stats views don't re-query IBKR on every
+page load — and so the numbers survive a backend restart, unlike everything
+else in this project so far (see "What's not in this step").
+
+- **Equity/ETF trades and options trades come from two different sources,
+  on purpose.** This app never places an equity order itself — a scalp
+  placed directly in TWS has no in-app record of it — so equities/ETFs are
+  rebuilt from IBKR's own execution history (`reqExecutions` for a
+  periodic backfill, `execDetailsEvent` for fills as they happen) and
+  matched into round trips FIFO, per symbol, flip-aware (`fifo_matcher.py`:
+  a fill that closes an open lot and reverses into the opposite direction
+  splits into a close plus a freshly opened lot in the new direction).
+  Options, by contrast, are taken directly from `PositionManager`'s own
+  entry/close tracking (see "The order flow" above) rather than re-derived
+  from raw option executions — it already has the exact entry/exit price
+  and realized P/L, multiplier included, that this app itself used when it
+  opened and closed the position, so re-parsing executions would just be a
+  worse copy of data already sitting in memory.
+- **Reconciliation, not just a one-time import.** `ExecutionSyncService`
+  backfills via `reqExecutions` on every IBKR reconnect and on a timer
+  (`JOURNAL_SYNC_INTERVAL_SECONDS`, default 5 minutes) — plus a manual
+  `POST /api/journal/sync` for "pull the numbers right now." Every run is
+  safe to repeat: each execution's `execId` is recorded in a
+  `synced_executions` dedup table the moment it's folded into the FIFO
+  matcher, so a re-run only ever picks up fills this process genuinely
+  hasn't seen yet (e.g. it wasn't running yet when they happened, or it
+  just reconnected) — it never re-matches (and re-realizes P/L for) the
+  same fill twice.
+- **Linking a trade back to the signal that triggered it** looks up the
+  most recent logged signal for that ticker and direction within a 5-minute
+  window before the trade's entry time (`ExecutionSyncService.
+  SIGNAL_LINK_WINDOW_SECONDS`) — every fired signal is logged to the same
+  database (`_record_signal_in_journal` in `main.py`) specifically so this
+  lookup has something to search. No match within the window just leaves
+  `signal_rule` `null` — most scalps in a real account won't have started
+  from this app's own signal engine at all, and that's an expected, valid
+  state, not an error.
+- **The weekly P/L total lives beside each calendar row, not as a single
+  number above the grid.** `month_stats` groups trades by ISO week
+  (Monday-start) and returns a `weekly_pnl` breakdown alongside the monthly
+  total; the frontend renders it as a trailing "week total" cell per row —
+  the layout real trading-journal calendars (TraderSync, TradeZella, etc.)
+  use, and more useful across a full month than a single "this week"
+  figure would be. A week that spans a month boundary only sums the trades
+  within the *requested* month, so a boundary week's total is a partial
+  figure in each of the two months it touches — a SQL-month-filtered
+  system's structural limitation, not a bug, noted here rather than
+  silently assumed.
+
+#### Trading journal tests
+
+```bash
+cd backend
+source .venv/bin/activate
+python -m pytest tests/test_fifo_matcher.py tests/test_journal_store.py tests/test_execution_sync.py -v
+```
+
+`test_fifo_matcher.py` covers the round-trip matching logic in isolation
+(simple long/short round trips, partial closes, FIFO ordering across
+multiple lots, a fill that closes a lot and reverses into a new one, and
+that different symbols are matched independently) — pure Python, no IBKR
+or database involved. `test_journal_store.py` covers the SQLite layer
+directly (day/month aggregation, win/loss stats, weekly grouping, signal
+lookup window/direction matching, execId dedup). `test_execution_sync.py`
+covers the service that ties it together, against a fake IBKR client using
+a real `eventkit.Event` for `execDetailsEvent` (same pattern as
+`test_portfolio_service.py`) so live-fill and backfill paths both behave
+exactly like production.
+
 ### Common error states
 
 The backend is built to surface these clearly instead of failing silently:
@@ -484,6 +576,14 @@ Open the printed local URL (default `http://localhost:5173`). You should see:
   — the options section additionally shows strike/expiry/delta/IV, and both
   show % of account (computed client-side from market value ÷ net
   liquidation, so it always uses whatever summary figure is freshest).
+- A **trading journal**: a monthly P/L calendar (day cells colored/labeled
+  by that day's realized P/L, a trailing weekly-total column per row, and a
+  month-total banner above it), a win-rate/avg-win/avg-loss/largest-win/loss
+  stats strip for the displayed month, and — click any day — the full list
+  of that day's closed trades with entry/exit price and time, contract
+  details for options, P/L, and the scalping rule (if any) that triggered
+  the entry. A "Sync with IBKR" button pulls the latest execution history
+  immediately on top of the automatic periodic reconciliation.
 
 ### The chart component
 
@@ -541,6 +641,7 @@ toast's ticker calls the same `onSelectSymbol` the chart's ticker tabs use.
 | `VITE_BACKEND_OPTIONS_WS_URL` | `ws://localhost:8000/ws/options` | Options chain quote WebSocket URL |
 | `VITE_BACKEND_POSITIONS_WS_URL` | `ws://localhost:8000/ws/positions` | Option positions WebSocket URL |
 | `VITE_BACKEND_PORTFOLIO_WS_URL` | `ws://localhost:8000/ws/portfolio` | Account positions/summary WebSocket URL |
+| `VITE_BACKEND_JOURNAL_WS_URL` | `ws://localhost:8000/ws/journal` | Trading journal "new trade recorded" WebSocket URL |
 
 ## Notes on the IBKR library choice
 
@@ -558,11 +659,17 @@ same API, so `from ib_async import IB, Stock` is a drop-in replacement for
   calls/puts only.
 - No true previous-close baseline for the watchlist's "% change today" —
   see the "Watchlist & portfolio" section's caveat.
-- No persistence of bar, signal, notification, order, position, or
-  portfolio history (only what's held in memory per backend process, and in
-  each browser's `localStorage`/tab memory). The relative-volume baseline,
-  Telegram's cooldown, and all open/closed positions reset on backend
-  restart for the same reason; the signal toast tray resets on page reload.
+- No persistence of bars, notifications, orders, or *open* positions (only
+  what's held in memory per backend process, and in each browser's
+  `localStorage`/tab memory). The relative-volume baseline, Telegram's
+  cooldown, and all open positions reset on backend restart; the signal
+  toast tray resets on page reload. The trading journal is the one
+  exception — closed round-trip trades and the signal log they're linked
+  against are persisted to SQLite and survive a restart (see "Trading
+  journal" above).
+- No cross-month aggregation for a calendar week that spans a month
+  boundary — the journal's weekly P/L total only sums trades within
+  whichever month is currently displayed (see "Trading journal" above).
 - Browser push notifications need the tab open (even if unfocused/backgrounded)
   — reaching you with the tab or browser fully closed is what the optional
   Telegram integration is for, not the Notifications API.

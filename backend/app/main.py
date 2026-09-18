@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import uuid
 from contextlib import asynccontextmanager
+from datetime import date
 from typing import Literal, Optional
 
 from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
@@ -14,6 +16,9 @@ from .account.portfolio import AnyPosition, PortfolioService
 from .config import get_settings
 from .ibkr.connection import ConnectionState, IBKRConnectionManager
 from .ibkr.market_data import MarketDataManager, TickerAlreadyTracked
+from .journal.db import JournalStore
+from .journal.execution_sync import ExecutionSyncService
+from .journal.models import JournalTrade, SignalLogEntry
 from .notifications.telegram import TelegramNotifier
 from .options.chain import OptionsChainError, OptionsChainService
 from .options.models import OptionContractKey, OptionPosition, StopTargetConfig
@@ -75,6 +80,12 @@ else:
         "TELEGRAM_CHAT_ID in .env to enable)"
     )
 
+# --- Trading journal --------------------------------------------------
+journal_store = JournalStore(settings.journal_db_path)
+execution_sync_service = ExecutionSyncService(
+    connection_manager.ib, journal_store, settings.journal_sync_interval_seconds
+)
+
 _status_subscribers: list[asyncio.Queue] = []
 _signal_subscribers: list[asyncio.Queue] = []
 
@@ -89,6 +100,23 @@ def _on_bar_closed(bar: Bar) -> None:
         logger.info("Signal fired: %s %s %s @ %s", signal.ticker, signal.rule, signal.direction, signal.price)
         _broadcast_signal(signal)
         _dispatch_telegram(signal)
+        _record_signal_in_journal(signal)
+
+
+def _record_signal_in_journal(signal: Signal) -> None:
+    try:
+        journal_store.record_signal(
+            SignalLogEntry(
+                id=str(uuid.uuid4()),
+                ticker=signal.ticker,
+                rule=signal.rule,
+                direction=signal.direction,
+                price=signal.price,
+                timestamp=signal.timestamp,
+            )
+        )
+    except Exception:
+        logger.exception("Failed to record signal %s in journal", signal.ticker)
 
 
 def _broadcast_signal(signal: Signal) -> None:
@@ -160,6 +188,7 @@ def _on_stop_target_alert(position: OptionPosition, level: str) -> None:
 
 
 position_manager.add_position_listener(_on_position_update)
+position_manager.add_position_listener(execution_sync_service.record_option_close)
 position_manager.add_alert_listener(_on_stop_target_alert)
 
 
@@ -201,6 +230,25 @@ def _on_account_summary(summary: AccountSummary) -> None:
 portfolio_service.add_position_listener(_on_account_position)
 portfolio_service.add_summary_listener(_on_account_summary)
 
+# --- Trading journal live sync -------------------------------------------
+
+_journal_subscribers: list[asyncio.Queue] = []
+
+
+def _broadcast_journal(payload: dict) -> None:
+    for queue in list(_journal_subscribers):
+        try:
+            queue.put_nowait(payload)
+        except asyncio.QueueFull:
+            logger.warning("Dropping journal update for slow WebSocket subscriber")
+
+
+def _on_journal_trade(trade: JournalTrade) -> None:
+    _broadcast_journal({"type": "trade_recorded", **trade.to_dict()})
+
+
+execution_sync_service.add_trade_listener(_on_journal_trade)
+
 
 def _broadcast_status(state: ConnectionState, error: str | None) -> None:
     payload = {"type": "status", "state": state.value, "error": error}
@@ -216,8 +264,14 @@ def _on_connection_state_for_portfolio(state: ConnectionState, error: str | None
         portfolio_service.start()
 
 
+def _on_connection_state_for_journal(state: ConnectionState, error: str | None) -> None:
+    if state == ConnectionState.CONNECTED:
+        execution_sync_service.start()
+
+
 connection_manager.add_state_listener(_broadcast_status)
 connection_manager.add_state_listener(_on_connection_state_for_portfolio)
+connection_manager.add_state_listener(_on_connection_state_for_journal)
 
 
 @asynccontextmanager
@@ -242,6 +296,8 @@ async def lifespan(app: FastAPI):
         await connection_manager.disconnect()
         if telegram_notifier is not None:
             await telegram_notifier.aclose()
+        execution_sync_service.stop()
+        journal_store.close()
 
 
 app = FastAPI(title="Scalp Dashboard Backend", lifespan=lifespan)
@@ -479,6 +535,43 @@ async def get_portfolio_summary():
     return portfolio_service.summary().to_dict()
 
 
+# --- Trading journal -------------------------------------------------------
+
+
+def _parse_journal_day(value: str) -> date:
+    try:
+        return date.fromisoformat(value)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail="day must be YYYY-MM-DD") from exc
+
+
+@app.get("/api/journal/calendar")
+async def get_journal_calendar(year: int, month: int):
+    days = journal_store.day_pnl_for_month(year, month)
+    return {"days": [d.to_dict() for d in days]}
+
+
+@app.get("/api/journal/day")
+async def get_journal_day(day: str):
+    trades = journal_store.trades_for_day(_parse_journal_day(day))
+    return {"trades": [t.to_dict() for t in trades]}
+
+
+@app.get("/api/journal/stats")
+async def get_journal_stats(year: int, month: int):
+    return journal_store.month_stats(year, month).to_dict()
+
+
+@app.post("/api/journal/sync")
+async def trigger_journal_sync():
+    """Manual reconciliation on top of the periodic background sync —
+    useful right after a session to pull the latest fills immediately
+    rather than waiting for the next interval."""
+    _require_ibkr_connected()
+    await execution_sync_service.sync_once()
+    return {"status": "ok"}
+
+
 @app.websocket("/ws/bars")
 async def stream_bars(websocket: WebSocket):
     await websocket.accept()
@@ -648,3 +741,32 @@ async def stream_portfolio(websocket: WebSocket):
         pump_task.cancel()
         if queue in _portfolio_subscribers:
             _portfolio_subscribers.remove(queue)
+
+
+@app.websocket("/ws/journal")
+async def stream_journal(websocket: WebSocket):
+    """Notifies the frontend when a new round-trip trade lands in the
+    journal DB (a live execDetailsEvent fill, a periodic reqExecutions
+    reconciliation, or an options-panel close) so the calendar/stats views
+    can refetch without polling. REST stays the source of truth for the
+    calendar/day/stats data itself — this channel only carries a nudge."""
+    await websocket.accept()
+
+    queue: asyncio.Queue = asyncio.Queue(maxsize=200)
+    _journal_subscribers.append(queue)
+
+    async def pump() -> None:
+        while True:
+            message = await queue.get()
+            await websocket.send_json(message)
+
+    pump_task = asyncio.create_task(pump())
+    try:
+        while True:
+            await websocket.receive_text()
+    except WebSocketDisconnect:
+        pass
+    finally:
+        pump_task.cancel()
+        if queue in _journal_subscribers:
+            _journal_subscribers.remove(queue)

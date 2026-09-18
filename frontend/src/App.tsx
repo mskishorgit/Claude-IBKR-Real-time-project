@@ -3,6 +3,7 @@ import { addTicker, closeOptionPosition, removeTicker } from "./api";
 import { AccountSummaryStrip } from "./components/AccountSummaryStrip";
 import { BarTable } from "./components/BarTable";
 import { ConnectionStatus } from "./components/ConnectionStatus";
+import { JournalPanel } from "./components/JournalPanel";
 import { LiveChartPanel } from "./components/LiveChartPanel";
 import { NotificationSettingsPanel } from "./components/NotificationSettingsPanel";
 import { OptionsPanel } from "./components/OptionsPanel";
@@ -11,6 +12,7 @@ import { SignalAlertTray } from "./components/SignalAlertTray";
 import { TradingModeBanner } from "./components/TradingModeBanner";
 import { WatchlistGrid } from "./components/WatchlistGrid";
 import { useBackendSocket } from "./useBackendSocket";
+import { useJournalStream } from "./useJournalStream";
 import { useNotificationCenter } from "./useNotificationCenter";
 import { useOptionsChainStream } from "./useOptionsChainStream";
 import { usePortfolioStream } from "./usePortfolioStream";
@@ -28,6 +30,7 @@ function App() {
   const { quotesByKey } = useOptionsChainStream();
   const { positions } = usePositionsStream();
   const portfolio = usePortfolioStream();
+  const { version: journalVersion } = useJournalStream();
 
   const [selectedSymbol, setSelectedSymbol] = useState<string | null>(null);
 
@@ -97,6 +100,11 @@ function App() {
           optionPositions={portfolio.optionPositions}
           summary={portfolio.summary}
         />
+      </section>
+
+      <section className="flex flex-col gap-3 rounded-lg border border-slate-800 p-4">
+        <h2 className="text-sm font-medium text-slate-300">Trading journal</h2>
+        <JournalPanel journalVersion={journalVersion} />
       </section>
 
       <section className="flex flex-col gap-3 rounded-lg border border-slate-800 p-4">

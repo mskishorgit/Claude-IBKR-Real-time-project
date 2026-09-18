@@ -52,6 +52,11 @@ class Settings(BaseSettings):
     options_strikes_each_side: int = 5
     options_chain_max_days_ahead: int = 7
 
+    # Trading journal: local SQLite persistence of closed round-trip
+    # trades, reconciled periodically against IBKR's execution history.
+    journal_db_path: str = "scalp_journal.db"
+    journal_sync_interval_seconds: float = 300.0
+
     @property
     def telegram_enabled(self) -> bool:
         return bool(self.telegram_bot_token and self.telegram_chat_id)
